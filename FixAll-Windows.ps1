@@ -107,6 +107,42 @@ function Release-RepairMutex {
     $script:RepairMutexAcquired = $false
 }
 
+function Get-OtherFixAllProcesses {
+    try {
+        $currentPid = [int]$PID
+        $all = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction Stop)
+        $byPid = @{}
+        foreach ($item in $all) {
+            $byPid[[int]$item.ProcessId] = $item
+        }
+
+        $ancestorPids = @($currentPid)
+        $cursor = $currentPid
+        while ($byPid.ContainsKey($cursor)) {
+            $parentPid = [int]$byPid[$cursor].ParentProcessId
+            if ($parentPid -le 0 -or $ancestorPids -contains $parentPid) {
+                break
+            }
+            $ancestorPids += $parentPid
+            $cursor = $parentPid
+        }
+
+        return @(
+            $all |
+                Where-Object { $ancestorPids -notcontains [int]$_.ProcessId -and [string]$_.CommandLine -match '(?i)FixAll-Windows\.ps1' } |
+                Select-Object ProcessId, Name, ParentProcessId, CommandLine, CreationDate
+        )
+    }
+    catch {
+        return @([pscustomobject]@{
+            ProcessId    = -1
+            Name         = 'ProcessProbeFailure'
+            CommandLine  = $_.Exception.Message
+            CreationDate = Get-Date
+        })
+    }
+}
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -1168,6 +1204,16 @@ if ($SelfTest) {
     Write-FinalSummary -ExitCode $selfTestExit -SelfTestMode
     Release-RepairMutex
     exit $selfTestExit
+}
+
+$otherFixAllProcesses = @(Get-OtherFixAllProcesses)
+if ($otherFixAllProcesses.Count -gt 0) {
+    $otherEvidence = ($otherFixAllProcesses | ForEach-Object { '{0} PID={1} command={2}' -f $_.Name, $_.ProcessId, $_.CommandLine }) -join ' | '
+    Add-RepairResult -Name 'Existing FixALL process guard' -Verdict 'BLOCKED' -ExitCode 1 -Evidence $otherEvidence
+    Write-RepairEvent -Percent 0 -Message ('An existing FixALL process or process-inventory failure was detected; refusing to run concurrently: {0}' -f $otherEvidence) -Level ERROR
+    Write-FinalSummary -ExitCode 1
+    Release-RepairMutex
+    exit 1
 }
 
 $script:CurrentStage = 'preflight'
