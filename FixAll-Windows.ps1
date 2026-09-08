@@ -63,6 +63,7 @@ $script:RepairMutex = $null
 $script:RepairMutexAcquired = $false
 $script:RepairMutexName = 'Global\FixALL-Windows-Repair'
 $script:RepairMutexFailureReason = $null
+$script:NativeGracefulCleanupSeconds = 30
 
 function Try-AcquireRepairMutex {
     try {
@@ -416,7 +417,18 @@ function Get-PendingOfflineVolumeChecks {
 }
 
 function Get-ActiveServicingProcesses {
-    $names = @('TiWorker', 'TrustedInstaller', 'MoUsoCoreWorker', 'UsoClient', 'WaaSMedicAgent')
+    $names = @(
+        'TiWorker',
+        'TrustedInstaller',
+        'MoUsoCoreWorker',
+        'UsoClient',
+        'WaaSMedicAgent',
+        'Dism',
+        'DismHost',
+        'sfc',
+        'chkdsk',
+        'fsutil'
+    )
     try {
         $processes = @(Get-Process -ErrorAction Stop | Where-Object { $names -contains $_.ProcessName } | Select-Object Id, ProcessName, StartTime)
         return $processes
@@ -424,6 +436,36 @@ function Get-ActiveServicingProcesses {
     catch {
         Register-ProbeFailure -Name 'servicing-process inventory' -Message $_.Exception.Message
         return @([pscustomobject]@{ Id = -1; ProcessName = 'ServicingProbeFailure'; StartTime = Get-Date })
+    }
+}
+
+function Wait-ForNativeProcessExit {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.Process]$Process,
+        [int]$TimeoutSeconds = 30
+    )
+
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        do {
+            $Process.Refresh()
+            if ($Process.HasExited) {
+                $Process.WaitForExit()
+                return $true
+            }
+            Start-Sleep -Milliseconds 500
+        } while ([DateTime]::UtcNow -lt $deadline)
+
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            $Process.WaitForExit()
+            return $true
+        }
+        return $false
+    }
+    catch {
+        return $false
     }
 }
 
@@ -608,11 +650,13 @@ function Read-AppendedNativeOutput {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][ref]$Position,
+        [Parameter(Mandatory = $true)][ref]$PendingFragment,
         [Parameter(Mandatory = $true)][string]$Label,
         [Parameter(Mandatory = $true)][string]$Level,
         [double]$StartPercent = $script:LastPercent,
         [double]$EndPercent = $StartPercent,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$Lines
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$Lines,
+        [switch]$FlushPartial
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -625,39 +669,81 @@ function Read-AppendedNativeOutput {
         $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         if ($Position.Value -gt $stream.Length) {
             $Position.Value = 0
+            $PendingFragment.Value = [string]::Empty
         }
         [void]$stream.Seek($Position.Value, [System.IO.SeekOrigin]::Begin)
         $reader = New-Object System.IO.StreamReader($stream, [Text.Encoding]::Default, $true, 4096, $true)
-        while (-not $reader.EndOfStream) {
-            $line = $reader.ReadLine()
-            if ($null -ne $line) {
-                # SFC can write UTF-16LE text without a BOM.  StreamReader then
-                # exposes embedded NULs; remove them before matching evidence or
-                # displaying progress so a real integrity failure cannot be
-                # mistaken for a clean exit code.
-                if ($line.IndexOf([char]0) -ge 0) {
-                    $line = $line.Replace(([string][char]0), [string]::Empty)
-                }
-                if ($line.IndexOf([char]0xFEFF) -ge 0) {
-                    $line = $line.Replace(([string][char]0xFEFF), [string]::Empty)
-                }
-                [void]$Lines.Add($line)
-                $script:LastNativeOutputAtUtc = [DateTime]::UtcNow
-                $script:NativeOutputLinesSeen++
-                $script:NativeOutputCharsSeen += [int64]$line.Length
-                $linePercent = $StartPercent
-                $percentageMatch = [regex]::Match($line, '(?<![\d.])(?<value>\d{1,3}(?:\.\d+)?)%')
-                if ($percentageMatch.Success) {
-                    $nativePercent = [double]$percentageMatch.Groups['value'].Value
-                    if ($nativePercent -ge 0 -and $nativePercent -le 100) {
-                        $script:LastNativeReportedPercent = $nativePercent
-                        $linePercent = $StartPercent + (($EndPercent - $StartPercent) * ($nativePercent / 100))
-                    }
-                }
-                Write-RepairEvent -Percent $linePercent -Message ('{0}: {1}' -f $Label, $line) -Level $Level
+        $newText = $reader.ReadToEnd()
+        $Position.Value = $stream.Position
+        $combined = ([string]$PendingFragment.Value) + ([string]$newText)
+        if ([string]::IsNullOrEmpty($combined)) {
+            if ($FlushPartial) {
+                $PendingFragment.Value = [string]::Empty
+            }
+            return
+        }
+
+        # Keep a partial final line in memory until a newline arrives or the
+        # native process has exited.  This prevents text-based failure/clean
+        # gates from missing phrases split across two polling reads.
+        if ($combined.IndexOf([char]0) -ge 0) {
+            $combined = $combined.Replace(([string][char]0), [string]::Empty)
+        }
+        if ($combined.IndexOf([char]0xFEFF) -ge 0) {
+            $combined = $combined.Replace(([string][char]0xFEFF), [string]::Empty)
+        }
+        $hasTerminatingNewline = $combined -match '(?:\r\n|\r|\n)$'
+        $parts = [regex]::Split($combined, '\r\n|\r|\n')
+        $emitCount = $parts.Count
+        if (-not $FlushPartial -and -not $hasTerminatingNewline) {
+            $emitCount--
+            $PendingFragment.Value = $parts[$parts.Count - 1]
+        }
+        else {
+            $PendingFragment.Value = [string]::Empty
+            if ($hasTerminatingNewline -and $emitCount -gt 0 -and $parts[$emitCount - 1] -eq '') {
+                $emitCount--
+            }
+            elseif ($FlushPartial -and -not $hasTerminatingNewline) {
+                $emitCount--
             }
         }
-        $Position.Value = $stream.Position
+
+        for ($index = 0; $index -lt $emitCount; $index++) {
+            $line = $parts[$index]
+            [void]$Lines.Add($line)
+            $script:LastNativeOutputAtUtc = [DateTime]::UtcNow
+            $script:NativeOutputLinesSeen++
+            $script:NativeOutputCharsSeen += [int64]$line.Length
+            $linePercent = $StartPercent
+            $percentageMatch = [regex]::Match($line, '(?<![\d.])(?<value>\d{1,3}(?:\.\d+)?)%')
+            if ($percentageMatch.Success) {
+                $nativePercent = [double]$percentageMatch.Groups['value'].Value
+                if ($nativePercent -ge 0 -and $nativePercent -le 100) {
+                    $script:LastNativeReportedPercent = $nativePercent
+                    $linePercent = $StartPercent + (($EndPercent - $StartPercent) * ($nativePercent / 100))
+                }
+            }
+            Write-RepairEvent -Percent $linePercent -Message ('{0}: {1}' -f $Label, $line) -Level $Level
+        }
+
+        if ($FlushPartial -and -not $hasTerminatingNewline -and $parts[$parts.Count - 1].Length -gt 0) {
+            $line = $parts[$parts.Count - 1]
+            [void]$Lines.Add($line)
+            $script:LastNativeOutputAtUtc = [DateTime]::UtcNow
+            $script:NativeOutputLinesSeen++
+            $script:NativeOutputCharsSeen += [int64]$line.Length
+            $linePercent = $StartPercent
+            $percentageMatch = [regex]::Match($line, '(?<![\d.])(?<value>\d{1,3}(?:\.\d+)?)%')
+            if ($percentageMatch.Success) {
+                $nativePercent = [double]$percentageMatch.Groups['value'].Value
+                if ($nativePercent -ge 0 -and $nativePercent -le 100) {
+                    $script:LastNativeReportedPercent = $nativePercent
+                    $linePercent = $StartPercent + (($EndPercent - $StartPercent) * ($nativePercent / 100))
+                }
+            }
+            Write-RepairEvent -Percent $linePercent -Message ('{0}: {1}' -f $Label, $line) -Level $Level
+        }
     }
     catch {
         $message = 'Could not read native output {0}: {1}' -f $Path, $_.Exception.Message
@@ -717,10 +803,21 @@ function Invoke-NativeTracked {
     $nativeJob = $null
     $stdoutPath = $null
     $stderrPath = $null
+    $stdoutFragment = [string]::Empty
+    $stderrFragment = [string]::Empty
+    $cleanupFailure = $false
+    $nativeProcessStillRunning = $false
 
     try {
         if ($Interactive) {
-            $process = Start-Process -FilePath $FilePath -ArgumentList $argumentText -PassThru -NoNewWindow -ErrorAction Stop
+            $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $startInfo.FileName = $FilePath
+            $startInfo.Arguments = $argumentText
+            $startInfo.UseShellExecute = $true
+            $startInfo.CreateNoWindow = $false
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $startInfo
+            [void]$process.Start()
             $nativeProcessId = [int]$process.Id
             while (-not $process.HasExited) {
                 $phaseSeconds = $script:Clock.Elapsed.TotalSeconds - $phaseStarted
@@ -757,8 +854,8 @@ function Invoke-NativeTracked {
             } -ArgumentList $FilePath, $argumentText, $stdoutPath, $stderrPath, $nativePidPath -ErrorAction Stop
 
             while ($true) {
-                Read-AppendedNativeOutput -Path $stdoutPath -Position ([ref]$stdoutPosition) -Label $Label -Level 'NATIVE' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
-                Read-AppendedNativeOutput -Path $stderrPath -Position ([ref]$stderrPosition) -Label $Label -Level 'WARN' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
+                Read-AppendedNativeOutput -Path $stdoutPath -Position ([ref]$stdoutPosition) -PendingFragment ([ref]$stdoutFragment) -Label $Label -Level 'NATIVE' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
+                Read-AppendedNativeOutput -Path $stderrPath -Position ([ref]$stderrPosition) -PendingFragment ([ref]$stderrFragment) -Label $Label -Level 'WARN' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
 
                 if ($nativeProcessId -eq 0 -and (Test-Path -LiteralPath $nativePidPath)) {
                     try {
@@ -784,8 +881,8 @@ function Invoke-NativeTracked {
             }
 
             Start-Sleep -Milliseconds 100
-            Read-AppendedNativeOutput -Path $stdoutPath -Position ([ref]$stdoutPosition) -Label $Label -Level 'NATIVE' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
-            Read-AppendedNativeOutput -Path $stderrPath -Position ([ref]$stderrPosition) -Label $Label -Level 'WARN' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
+            Read-AppendedNativeOutput -Path $stdoutPath -Position ([ref]$stdoutPosition) -PendingFragment ([ref]$stdoutFragment) -Label $Label -Level 'NATIVE' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines -FlushPartial
+            Read-AppendedNativeOutput -Path $stderrPath -Position ([ref]$stderrPosition) -PendingFragment ([ref]$stderrFragment) -Label $Label -Level 'WARN' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines -FlushPartial
             if ($nativeJob.State -eq 'Completed') {
                 $received = @(Receive-Job -Job $nativeJob -ErrorAction Stop)
                 if ($received.Count -gt 0) {
@@ -809,42 +906,117 @@ function Invoke-NativeTracked {
         $exitCode = 9009
     }
     finally {
-        # Never leave an interactive repair process or captured child running
-        # after an output/host exception.  Wait for graceful native completion;
-        # do not force-terminate Windows repair tools from this cleanup path.
+        # Never force-terminate Windows repair tools from cleanup.  Allow a
+        # bounded graceful wait, then return BLOCKED while leaving the native
+        # PID visible to the next preflight instead of silently orphaning it.
         if ($process) {
             try {
                 $process.Refresh()
-                while (-not $process.HasExited) {
-                    Start-Sleep -Milliseconds 500
-                    $process.Refresh()
+                if (-not $process.HasExited) {
+                    Write-RepairEvent -Percent $script:LastPercent -Message ('Gracefully waiting up to {0}s for native child PID {1} during cleanup; no force termination will be attempted.' -f $script:NativeGracefulCleanupSeconds, $nativeProcessId) -Level WARN
+                    if (-not (Wait-ForNativeProcessExit -Process $process -TimeoutSeconds $script:NativeGracefulCleanupSeconds)) {
+                        $nativeProcessStillRunning = $true
+                        $cleanupFailure = $true
+                        $message = 'Native child PID {0} remained running after the {1}s graceful cleanup wait; no force termination was attempted.' -f $nativeProcessId, $script:NativeGracefulCleanupSeconds
+                        [void]$lines.Add($message)
+                        Write-RepairEvent -Percent $script:LastPercent -Message $message -Level ERROR
+                    }
                 }
-                $process.WaitForExit()
+                else {
+                    $process.WaitForExit()
+                }
             }
             catch {
-                # Preserve the original failure evidence.
+                $cleanupFailure = $true
+                $message = 'Could not reconcile native child PID {0} during cleanup: {1}' -f $nativeProcessId, $_.Exception.Message
+                [void]$lines.Add($message)
+                Write-RepairEvent -Percent $script:LastPercent -Message $message -Level ERROR
+            }
+        }
+
+        if (-not $Interactive) {
+            if ($nativeProcessId -eq 0 -and $nativePidPath -and (Test-Path -LiteralPath $nativePidPath)) {
+                try {
+                    $nativeProcessId = [int](Get-Content -LiteralPath $nativePidPath -Raw -ErrorAction Stop).Trim()
+                }
+                catch {
+                    $nativeProcessId = 0
+                }
+            }
+
+            if ($nativeProcessId -gt 0) {
+                $capturedProcess = $null
+                try {
+                    $capturedProcess = Get-Process -Id $nativeProcessId -ErrorAction Stop
+                }
+                catch {
+                    $capturedProcess = $null
+                }
+
+                if ($capturedProcess) {
+                    Write-RepairEvent -Percent $script:LastPercent -Message ('Reconciling captured native child PID {0} for up to {1}s; no force termination will be attempted.' -f $nativeProcessId, $script:NativeGracefulCleanupSeconds) -Level WARN
+                    if (-not (Wait-ForNativeProcessExit -Process $capturedProcess -TimeoutSeconds $script:NativeGracefulCleanupSeconds)) {
+                        $nativeProcessStillRunning = $true
+                        $cleanupFailure = $true
+                        $message = 'Captured native child PID {0} remained running after the {1}s graceful cleanup wait; no force termination was attempted.' -f $nativeProcessId, $script:NativeGracefulCleanupSeconds
+                        [void]$lines.Add($message)
+                        Write-RepairEvent -Percent $script:LastPercent -Message $message -Level ERROR
+                    }
+                }
             }
         }
 
         if ($nativeJob) {
             try {
-                if ($nativeJob.State -in @('NotStarted', 'Running')) {
-                    Wait-Job -Job $nativeJob -ErrorAction SilentlyContinue | Out-Null
+                $job = Get-Job -Id $nativeJob.Id -ErrorAction SilentlyContinue
+                if ($job -and $job.State -in @('NotStarted', 'Running')) {
+                    $jobTimeout = if ($nativeProcessStillRunning) { 1 } else { $script:NativeGracefulCleanupSeconds }
+                    $completedJob = Wait-Job -Job $job -Timeout $jobTimeout -ErrorAction SilentlyContinue
+                    $job = Get-Job -Id $nativeJob.Id -ErrorAction SilentlyContinue
+                    if ($job -and $job.State -in @('NotStarted', 'Running')) {
+                        $cleanupFailure = $true
+                        if ($nativeProcessId -le 0) {
+                            $nativeProcessStillRunning = $true
+                        }
+                        $message = 'Native wrapper job did not complete within the bounded cleanup wait; the child was not force-terminated.'
+                        [void]$lines.Add($message)
+                        Write-RepairEvent -Percent $script:LastPercent -Message $message -Level ERROR
+                    }
+                }
+                if ($job) {
+                    Remove-Job -Job $job -Force -ErrorAction Stop
                 }
             }
             catch {
-                # Preserve the original failure evidence.
+                $cleanupFailure = $true
+                $message = 'Could not clean up native wrapper job: {0}' -f $_.Exception.Message
+                [void]$lines.Add($message)
+                Write-RepairEvent -Percent $script:LastPercent -Message $message -Level ERROR
             }
-            Remove-Job -Job $nativeJob -Force -ErrorAction SilentlyContinue
         }
 
         $temporaryPaths = @($stdoutPath, $stderrPath, $nativePidPath) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
-        if ($temporaryPaths.Count -gt 0) {
-            Remove-Item -LiteralPath $temporaryPaths -Force -ErrorAction SilentlyContinue
+        foreach ($temporaryPath in $temporaryPaths) {
+            if (-not (Test-Path -LiteralPath $temporaryPath)) {
+                continue
+            }
+            try {
+                Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction Stop
+            }
+            catch {
+                $cleanupFailure = $true
+                $message = 'Could not remove native capture file {0}: {1}' -f $temporaryPath, $_.Exception.Message
+                [void]$lines.Add($message)
+                Write-RepairEvent -Percent $script:LastPercent -Message $message -Level ERROR
+            }
+        }
+
+        if ($cleanupFailure -and $exitCode -in @(0, 3010)) {
+            $exitCode = 9009
         }
     }
 
-    $verdict = if ($exitCode -eq 0) { 'PASS' } elseif ($exitCode -eq 3010) { 'REBOOT_REQUIRED' } else { 'FAIL' }
+    $verdict = if ($nativeProcessStillRunning) { 'BLOCKED' } elseif ($exitCode -eq 0) { 'PASS' } elseif ($exitCode -eq 3010) { 'REBOOT_REQUIRED' } else { 'FAIL' }
     if ($verdict -eq 'REBOOT_REQUIRED') {
         $script:Unresolved += ('{0}: native process requested reboot (3010)' -f $Label)
     }
@@ -1193,12 +1365,19 @@ if ($SelfTest) {
     catch {
         Add-RepairResult -Name 'Volume inventory' -Verdict 'FAIL' -ExitCode 1 -Evidence $_.Exception.Message
     }
-    $nativeSelfTest = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\cmd.exe') -Arguments @('/d', '/c', 'ping.exe 127.0.0.1 -n 4 >nul & echo FixALL-native-selftest 50%') -Label 'Native process capture self-test' -StartPercent 60 -EndPercent 80
+    $nativeSelfTest = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\cmd.exe') -Arguments @('/d', '/c', 'ping.exe 127.0.0.1 -n 4 >nul & <nul set /p=FixALL-native-selftest 50% & exit /b 0') -Label 'Native process capture self-test' -StartPercent 60 -EndPercent 80
     if ($nativeSelfTest.ExitCode -eq 0 -and @($nativeSelfTest.Lines | Where-Object { $_ -match 'FixALL-native-selftest' }).Count -gt 0) {
         Add-RepairResult -Name 'Native process capture' -Verdict 'PASS' -Evidence 'Captured expected native stdout.'
     }
     else {
         Add-RepairResult -Name 'Native process capture' -Verdict 'FAIL' -ExitCode $nativeSelfTest.ExitCode -Evidence 'Did not capture expected native stdout.'
+    }
+    $interactiveSelfTest = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\cmd.exe') -Arguments @('/d', '/c', 'exit /b 0') -Label 'Native interactive lifecycle self-test' -StartPercent 80 -EndPercent 90 -Interactive
+    if ($interactiveSelfTest.ExitCode -eq 0 -and $interactiveSelfTest.Verdict -eq 'PASS') {
+        Add-RepairResult -Name 'Native interactive lifecycle' -Verdict 'PASS' -Evidence 'Interactive native process exited cleanly with a verified exit code.'
+    }
+    else {
+        Add-RepairResult -Name 'Native interactive lifecycle' -Verdict 'FAIL' -ExitCode $interactiveSelfTest.ExitCode -Evidence 'Interactive native process did not return a verified clean exit.'
     }
     $selfTestExit = if ($script:Unresolved.Count -eq 0) { 0 } else { 1 }
     Write-FinalSummary -ExitCode $selfTestExit -SelfTestMode
