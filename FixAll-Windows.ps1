@@ -348,7 +348,7 @@ function Get-ServicingActivityFingerprint {
     foreach ($item in $active) {
         try {
             $process = Get-Process -Id $item.Id -ErrorAction Stop
-            $parts += ('{0}:{1}:{2}:{3}' -f $item.Id, $process.TotalProcessorTime.Ticks, $process.WorkingSet64, $process.PagedMemorySize64)
+            $parts += ('{0}:{1}' -f $item.Id, $process.TotalProcessorTime.Ticks)
         }
         catch {
             Register-ProbeFailure -Name 'servicing-process activity' -Message $_.Exception.Message
