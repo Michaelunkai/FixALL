@@ -172,7 +172,23 @@ function Get-PendingRebootReasons {
         $reasons += $pendingXml
     }
 
+    foreach ($drive in @(Get-PendingOfflineVolumeChecks)) {
+        $reasons += ('Pending offline CHKDSK for {0}' -f $drive)
+    }
+
     return $reasons
+}
+
+function Get-PendingOfflineVolumeChecks {
+    $bootExecutePath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    $property = Get-ItemProperty -LiteralPath $bootExecutePath -Name BootExecute -ErrorAction SilentlyContinue
+    $pending = @()
+    foreach ($line in @($property.BootExecute)) {
+        if ($line -match '(?i)(?<drive>[A-Z]):\s*$' -and $line -match '(?i)autocheck\s+autochk') {
+            $pending += ($Matches['drive'].ToUpperInvariant() + ':')
+        }
+    }
+    return @($pending | Select-Object -Unique)
 }
 
 function Get-ActiveServicingProcesses {
@@ -451,6 +467,7 @@ function Invoke-VolumeCheck {
         Write-RepairEvent -Percent $StartPercent -Message ($label + ': ' + $evidence) -Level WARN
         $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' low-space /f') -StartPercent $StartPercent -EndPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.78)) -Interactive
         $repairNeedsReboot = ($fix.ExitCode -eq 3010) -or @($fix.Lines | Where-Object { $_ -match '(?i)schedule.*next restart|reboot|restart' }).Count -gt 0
+        $repairNeedsReboot = $repairNeedsReboot -or @((Get-PendingOfflineVolumeChecks) | Where-Object { $_ -eq $drive }).Count -gt 0
         if ($repairNeedsReboot) {
             Add-RepairResult -Name $label -Verdict 'REBOOT_REQUIRED' -ExitCode 3010 -Evidence 'Low-space filesystem repair could not complete online and requires a reboot.'
             return
@@ -485,8 +502,11 @@ function Invoke-VolumeCheck {
         if ($scanNeedsRepair) {
             Write-RepairEvent -Percent ($StartPercent + (($EndPercent - $StartPercent) * 0.55)) -Message ($label + ': online scan indicates repair is needed; launching interactive /f without force-dismount.') -Level WARN
             $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' /f') -StartPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.55)) -EndPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.82)) -Interactive
-            if ($fix.ExitCode -eq 3010 -or @($fix.Lines | Where-Object { $_ -match '(?i)schedule.*next restart|reboot' }).Count -gt 0) {
+            $offlinePending = @((Get-PendingOfflineVolumeChecks) | Where-Object { $_ -eq $drive }).Count -gt 0
+            if ($fix.ExitCode -eq 3010 -or $offlinePending -or @($fix.Lines | Where-Object { $_ -match '(?i)schedule.*next restart|reboot' }).Count -gt 0) {
                 $script:Unresolved += ('{0}: offline repair requires a reboot.' -f $label)
+                Add-RepairResult -Name ($label + ' /f') -Verdict 'REBOOT_REQUIRED' -ExitCode 3010 -Evidence 'Offline CHKDSK was scheduled or reported that a reboot is required.'
+                return
             }
             if ($fix.ExitCode -notin @(0, 1)) {
                 Add-RepairResult -Name ($label + ' /f') -Verdict 'FAIL' -ExitCode $fix.ExitCode -Evidence $fix.Evidence
@@ -506,7 +526,11 @@ function Invoke-VolumeCheck {
     else {
         Write-RepairEvent -Percent $StartPercent -Message ('{0}: {1} uses a non-NTFS filesystem; using /f with an interactive console.' -f $label, $Volume.FileSystem) -Level WARN
         $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' /f') -StartPercent $StartPercent -EndPercent $EndPercent -Interactive
-        if ($fix.ExitCode -in @(0, 1)) {
+        $offlinePending = @((Get-PendingOfflineVolumeChecks) | Where-Object { $_ -eq $drive }).Count -gt 0
+        if ($offlinePending -or $fix.ExitCode -eq 3010) {
+            Add-RepairResult -Name $label -Verdict 'REBOOT_REQUIRED' -ExitCode 3010 -Evidence 'Offline CHKDSK was scheduled or reported that a reboot is required.'
+        }
+        elseif ($fix.ExitCode -in @(0, 1)) {
             Add-RepairResult -Name $label -Verdict 'PASS' -ExitCode $fix.ExitCode -Evidence $fix.Evidence
         }
         elseif ($fix.ExitCode -eq 3010) {
