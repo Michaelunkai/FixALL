@@ -495,12 +495,52 @@ function Get-ServicingActivityFingerprint {
     return (($parts | Sort-Object) -join '|') + ';CBS=' + $cbsPart
 }
 
+function Get-CbsAttentionEvidence {
+    param([int]$TailLines = 2500)
+
+    $cbsPath = Join-Path $env:windir 'Logs\CBS\CBS.log'
+    if (-not (Test-Path -LiteralPath $cbsPath)) {
+        return $null
+    }
+
+    try {
+        $patterns = @(
+            '(?i)Corruption detection complete\..*numCorruptions\s*=\s*[1-9][0-9]*',
+            '(?i)CorruptPayloadFile',
+            '(?i)Non CBS installed component found.*corrupt file',
+            '(?i)CBS_E_COMPONENT_NOT_INSTALLED_BY_CBS',
+            '(?i)possible deadlock detected',
+            '(?i)Failed to initialize CBS session',
+            '(?i)WU_E_TIME_OUT',
+            '(?i)Failed to download actual content'
+        )
+        $matches = @(Get-Content -LiteralPath $cbsPath -Tail $TailLines -ErrorAction Stop | Select-String -Pattern $patterns -CaseSensitive:$false)
+        if ($matches.Count -eq 0) {
+            return $null
+        }
+
+        $evidence = @($matches | Select-Object -Last 8 | ForEach-Object {
+            ([string]$_.Line -replace '\s+', ' ').Trim()
+        })
+        $joined = $evidence -join ' | '
+        if ($joined.Length -gt 1200) {
+            $joined = $joined.Substring(0, 1200)
+        }
+        return $joined
+    }
+    catch {
+        return $null
+    }
+}
+
 function Wait-ForServicingIdle {
     param([int]$MaximumMinutes)
 
     $started = $script:Clock.Elapsed.TotalSeconds
     $lastFingerprint = $null
     $lastActivityChange = $started
+    $lastCbsEvidence = $null
+    $lastCbsCheck = -30
     while ($true) {
         $active = @(Get-ActiveServicingProcesses)
         if ($script:ProbeFailures.Count -gt 0) {
@@ -521,8 +561,16 @@ function Wait-ForServicingIdle {
         $elapsedMinutes = (($script:Clock.Elapsed.TotalSeconds - $started) / 60)
         if ($elapsedMinutes -ge $MaximumMinutes) {
             $names = ($active | ForEach-Object { '{0} (PID {1})' -f $_.ProcessName, $_.Id }) -join ', '
-            Add-RepairResult -Name 'Servicing-idle preflight' -Verdict 'BLOCKED' -Evidence ('Timed out after {0} minutes; still active: {1}' -f $MaximumMinutes, $names)
+            $timeoutEvidence = Get-CbsAttentionEvidence -TailLines 5000
+            $evidence = 'Timed out after {0} minutes; still active: {1}' -f $MaximumMinutes, $names
+            if ($timeoutEvidence) {
+                $evidence += '; CBS attention evidence: ' + $timeoutEvidence
+            }
+            Add-RepairResult -Name 'Servicing-idle preflight' -Verdict 'BLOCKED' -Evidence $evidence
             Write-RepairEvent -Percent 5 -Message ('Servicing remained active after {0} minutes: {1}' -f $MaximumMinutes, $names) -Level ERROR
+            if ($timeoutEvidence) {
+                Write-RepairEvent -Percent 5 -Message ('CBS_ATTENTION_EVIDENCE at servicing timeout; action=WAIT_ONLY; evidence={0}' -f $timeoutEvidence) -Level ERROR
+            }
             return $false
         }
 
@@ -543,6 +591,16 @@ function Wait-ForServicingIdle {
         $watchdog = if ($unchangedSeconds -ge 60) { 'SAFE_STALL_WATCH' } else { 'SERVICING_ACTIVITY_MONITORED' }
         $liveness = Get-ServicingLivenessSummary -Active $active
         Write-RepairEvent -Percent 4.5 -Message ('SERVICING_HEARTBEAT; active={0}; liveness={1}; activity={2}; unchanged={3}s; watchdog={4}; action=WAIT_ONLY' -f $names, $liveness, $activityState, $unchangedSeconds, $watchdog) -Level WARN
+
+        $elapsedSeconds = $script:Clock.Elapsed.TotalSeconds
+        if (($elapsedSeconds - $lastCbsCheck) -ge 30) {
+            $lastCbsCheck = $elapsedSeconds
+            $cbsEvidence = Get-CbsAttentionEvidence
+            if ($cbsEvidence -and $cbsEvidence -ne $lastCbsEvidence) {
+                Write-RepairEvent -Percent 4.5 -Message ('CBS_ATTENTION_EVIDENCE; action=WAIT_ONLY; evidence={0}' -f $cbsEvidence) -Level WARN
+            }
+            $lastCbsEvidence = $cbsEvidence
+        }
         Start-Sleep -Seconds 5
     }
 }
