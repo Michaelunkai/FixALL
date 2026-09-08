@@ -935,7 +935,7 @@ function Stop-IfRepairUnsafe {
     $unsafe = @($script:Results | Where-Object { $_.Verdict -in @('BLOCKED', 'REBOOT_REQUIRED') })
     if ($unsafe.Count -gt 0) {
         $reboot = @($unsafe | Where-Object { $_.Verdict -eq 'REBOOT_REQUIRED' }).Count -gt 0
-        $hardFailure = @($script:Results | Where-Object { $_.Verdict -in @('FAIL', 'UNRESOLVED', 'BLOCKED', 'SKIPPED_LOW_SPACE') }).Count -gt 0
+        $hardFailure = @($script:Results | Where-Object { $_.Verdict -in @('FAIL', 'ATTENTION', 'UNRESOLVED', 'BLOCKED', 'SKIPPED_LOW_SPACE') }).Count -gt 0
         $code = if ($reboot -and -not $hardFailure) { 3010 } else { 1 }
         Write-RepairEvent -Percent $script:LastPercent -Message 'Stopping before the next phase because a safety gate returned BLOCKED or REBOOT_REQUIRED.' -Level ERROR
         Write-FinalSummary -ExitCode $code
