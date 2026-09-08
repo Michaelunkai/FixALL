@@ -33,6 +33,8 @@ The default servicing wait is 720 minutes (12 hours), with observable heartbeats
 
 When a pending reboot marker is present, reboot Windows manually and run the script again; it intentionally stops before starting a competing servicing transaction. NTFS volumes with insufficient free space use an interactive `/f` fallback and dirty-bit verification instead of silently declaring an online `/scan` successful. Non-NTFS volumes require a second `/f` verification with clean filesystem evidence.
 
+When `-RepairSource` is supplied, the script first validates the literal path before starting DISM. It accepts a mounted Windows directory or a `.wim`, `.esd`, or `.swm` image with an optional index and fails closed for missing or malformed sources. This checks path shape and availability only; the source must still be from the same Windows release/build (and sufficiently patched) for DISM repair.
+
 Optional examples:
 
 ```powershell

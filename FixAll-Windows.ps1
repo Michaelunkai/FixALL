@@ -581,6 +581,88 @@ function Get-PendingServicingSessionEvidence {
     }
 }
 
+function Test-ExplicitRepairSource {
+    if ([string]::IsNullOrWhiteSpace($RepairSource)) {
+        return [pscustomobject]@{
+            Valid    = $true
+            Evidence = 'No explicit repair source supplied; DISM will use its configured Windows Update or policy source.'
+        }
+    }
+
+    $source = $RepairSource.Trim()
+    $candidate = $source
+    $sourceKind = 'DIRECT'
+    $index = $null
+
+    # DISM accepts a mounted Windows directory or an image path with an
+    # optional image index. Keep the path literal so drive letters and spaces
+    # are not damaged by wildcard expansion or ad-hoc string splitting.
+    $imageMatch = [regex]::Match($source, '^(?i)(?:(?<prefix>wim|esd):)?(?<path>.+\.(?:wim|esd|swm)):(?<index>[0-9]+)$')
+    if ($imageMatch.Success) {
+        $candidate = $imageMatch.Groups['path'].Value
+        $sourceKind = $imageMatch.Groups['prefix'].Value.ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($sourceKind)) { $sourceKind = 'IMAGE' }
+        $index = [int]$imageMatch.Groups['index'].Value
+        if ($index -lt 1) {
+            return [pscustomobject]@{
+                Valid    = $false
+                Evidence = ('Explicit repair source has an invalid image index: {0}' -f $index)
+            }
+        }
+    }
+    elseif ($source -match '^(?i)(?:wim|esd):') {
+        $candidate = $source.Substring($source.IndexOf(':') + 1)
+        $sourceKind = $source.Substring(0, $source.IndexOf(':')).ToUpperInvariant()
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $candidate -ErrorAction Stop)) {
+            return [pscustomobject]@{
+                Valid    = $false
+                Evidence = ('Explicit repair source does not exist: {0}' -f $candidate)
+            }
+        }
+
+        $item = Get-Item -LiteralPath $candidate -ErrorAction Stop
+        if ($item.PSIsContainer) {
+            $root = $item.FullName.TrimEnd('\')
+            $packagePath = Join-Path $root 'servicing\Packages'
+            $nestedPackagePath = Join-Path $root 'Windows\servicing\Packages'
+            if (-not (Test-Path -LiteralPath $packagePath -PathType Container -ErrorAction Stop) -and
+                -not (Test-Path -LiteralPath $nestedPackagePath -PathType Container -ErrorAction Stop)) {
+                return [pscustomobject]@{
+                    Valid    = $false
+                    Evidence = ('Explicit repair source directory is not a mounted Windows root or Windows directory: {0}' -f $item.FullName)
+                }
+            }
+
+            return [pscustomobject]@{
+                Valid    = $true
+                Evidence = ('Validated mounted/directory repair source: {0}; source must still match the target Windows build.' -f $item.FullName)
+            }
+        }
+
+        if ($item.Extension -notmatch '(?i)^\.(wim|esd|swm)$') {
+            return [pscustomobject]@{
+                Valid    = $false
+                Evidence = ('Explicit repair source file must be .wim, .esd, or .swm: {0}' -f $item.FullName)
+            }
+        }
+
+        $indexEvidence = if ($null -ne $index) { '; image index={0}' -f $index } else { '' }
+        return [pscustomobject]@{
+            Valid    = $true
+            Evidence = ('Validated {0} repair image: {1}{2}; source must still match the target Windows build.' -f $sourceKind, $item.FullName, $indexEvidence)
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Valid    = $false
+            Evidence = ('Could not validate explicit repair source {0}: {1}' -f $candidate, $_.Exception.Message)
+        }
+    }
+}
+
 function Wait-ForServicingIdle {
     param([int]$MaximumMinutes)
 
@@ -1465,6 +1547,15 @@ Write-RepairEvent -Percent 1 -Message ('OS: {0}; build {1}; system drive {2}' -f
 if ($SelfTest) {
     $script:CurrentStage = 'self-test'
     Write-RepairEvent -Percent 10 -Message 'Self-test mode: no repair commands will be launched.' -Level INFO
+    $sourceSelfTest = Test-ExplicitRepairSource
+    if ($sourceSelfTest.Valid) {
+        Add-RepairResult -Name 'Explicit repair source preflight' -Verdict 'PASS' -Evidence $sourceSelfTest.Evidence
+        Write-RepairEvent -Percent 15 -Message $sourceSelfTest.Evidence -Level INFO
+    }
+    else {
+        Add-RepairResult -Name 'Explicit repair source preflight' -Verdict 'BLOCKED' -ExitCode 2 -Evidence $sourceSelfTest.Evidence
+        Write-RepairEvent -Percent 15 -Message $sourceSelfTest.Evidence -Level ERROR
+    }
     $required = @('Dism.exe', 'sfc.exe', 'chkdsk.exe')
     foreach ($name in ($required + 'fsutil.exe')) {
         if (Get-Command $name -ErrorAction SilentlyContinue) {
@@ -1521,7 +1612,22 @@ foreach ($tool in @('Dism.exe', 'sfc.exe', 'chkdsk.exe', 'fsutil.exe')) {
     }
 }
 
-$activeIdle = Wait-ForServicingIdle -MaximumMinutes $ServicingWaitMinutes
+$sourcePreflight = Test-ExplicitRepairSource
+if ($sourcePreflight.Valid) {
+    Add-RepairResult -Name 'Explicit repair source preflight' -Verdict 'PASS' -Evidence $sourcePreflight.Evidence
+    Write-RepairEvent -Percent 3 -Message $sourcePreflight.Evidence -Level INFO
+}
+else {
+    Add-RepairResult -Name 'Explicit repair source preflight' -Verdict 'BLOCKED' -ExitCode 2 -Evidence $sourcePreflight.Evidence
+    Write-RepairEvent -Percent 3 -Message $sourcePreflight.Evidence -Level ERROR
+}
+
+$activeIdle = if ($sourcePreflight.Valid) {
+    Wait-ForServicingIdle -MaximumMinutes $ServicingWaitMinutes
+}
+else {
+    $false
+}
 $pendingReasons = @(Get-PendingRebootReasons)
 if ($pendingReasons.Count -gt 0) {
     $reasonText = $pendingReasons -join '; '
