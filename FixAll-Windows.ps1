@@ -533,6 +533,54 @@ function Get-CbsAttentionEvidence {
     }
 }
 
+function Get-PendingServicingSessionEvidence {
+    $pendingRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\SessionsPending'
+    $sessionRoot = Join-Path $env:windir 'servicing\Sessions'
+    if (-not (Test-Path -LiteralPath $pendingRoot) -or -not (Test-Path -LiteralPath $sessionRoot)) {
+        return $null
+    }
+
+    try {
+        $sessionIds = @(Get-ChildItem -LiteralPath $pendingRoot -ErrorAction Stop |
+            Select-Object -ExpandProperty PSChildName |
+            Sort-Object -Descending |
+            Select-Object -First 4)
+        $records = @()
+        foreach ($sessionId in $sessionIds) {
+            $sessionPath = Join-Path $sessionRoot ($sessionId + '.xml')
+            if (-not (Test-Path -LiteralPath $sessionPath)) {
+                $records += ('session={0};xml=missing' -f $sessionId)
+                continue
+            }
+
+            $headerLines = @(Get-Content -LiteralPath $sessionPath -TotalCount 100 -ErrorAction Stop)
+            $sessionLine = $headerLines | Where-Object { $_ -match '<Session\s' } | Select-Object -First 1
+            $packageLines = @($headerLines | Where-Object { $_ -match '<package\s' } | Select-Object -First 3)
+            $status = if ($sessionLine -and $sessionLine -match 'status="([^"]+)"') { $Matches[1] } else { 'unknown' }
+            $packages = @($packageLines | ForEach-Object {
+                $packageId = if ($_ -match 'id="([^"]+)"') { $Matches[1] } else { 'unknown' }
+                $packageName = if ($_ -match 'name="([^"]+)"') { $Matches[1] } else { 'unknown' }
+                $target = if ($_ -match 'targetState="([^"]+)"') { $Matches[1] } else { 'unknown' }
+                '{0};name={1};target={2}' -f $packageId, $packageName, $target
+            })
+            $packageText = if ($packages.Count -gt 0) { $packages -join ',' } else { 'package=unknown' }
+            $records += ('session={0};status={1};{2}' -f $sessionId, $status, $packageText)
+        }
+
+        if ($records.Count -eq 0) {
+            return $null
+        }
+        $joined = $records -join ' | '
+        if ($joined.Length -gt 1200) {
+            $joined = $joined.Substring(0, 1200)
+        }
+        return $joined
+    }
+    catch {
+        return $null
+    }
+}
+
 function Wait-ForServicingIdle {
     param([int]$MaximumMinutes)
 
@@ -540,6 +588,7 @@ function Wait-ForServicingIdle {
     $lastFingerprint = $null
     $lastActivityChange = $started
     $lastCbsEvidence = $null
+    $lastPendingSessionEvidence = $null
     $lastCbsCheck = -30
     while ($true) {
         $active = @(Get-ActiveServicingProcesses)
@@ -562,14 +611,21 @@ function Wait-ForServicingIdle {
         if ($elapsedMinutes -ge $MaximumMinutes) {
             $names = ($active | ForEach-Object { '{0} (PID {1})' -f $_.ProcessName, $_.Id }) -join ', '
             $timeoutEvidence = Get-CbsAttentionEvidence -TailLines 5000
+            $timeoutSessionEvidence = Get-PendingServicingSessionEvidence
             $evidence = 'Timed out after {0} minutes; still active: {1}' -f $MaximumMinutes, $names
             if ($timeoutEvidence) {
                 $evidence += '; CBS attention evidence: ' + $timeoutEvidence
+            }
+            if ($timeoutSessionEvidence) {
+                $evidence += '; pending session evidence: ' + $timeoutSessionEvidence
             }
             Add-RepairResult -Name 'Servicing-idle preflight' -Verdict 'BLOCKED' -Evidence $evidence
             Write-RepairEvent -Percent 5 -Message ('Servicing remained active after {0} minutes: {1}' -f $MaximumMinutes, $names) -Level ERROR
             if ($timeoutEvidence) {
                 Write-RepairEvent -Percent 5 -Message ('CBS_ATTENTION_EVIDENCE at servicing timeout; action=WAIT_ONLY; evidence={0}' -f $timeoutEvidence) -Level ERROR
+            }
+            if ($timeoutSessionEvidence) {
+                Write-RepairEvent -Percent 5 -Message ('PENDING_SESSION_EVIDENCE at servicing timeout; action=WAIT_ONLY; evidence={0}' -f $timeoutSessionEvidence) -Level ERROR
             }
             return $false
         }
@@ -600,6 +656,11 @@ function Wait-ForServicingIdle {
                 Write-RepairEvent -Percent 4.5 -Message ('CBS_ATTENTION_EVIDENCE; action=WAIT_ONLY; evidence={0}' -f $cbsEvidence) -Level WARN
             }
             $lastCbsEvidence = $cbsEvidence
+            $pendingSessionEvidence = Get-PendingServicingSessionEvidence
+            if ($pendingSessionEvidence -and $pendingSessionEvidence -ne $lastPendingSessionEvidence) {
+                Write-RepairEvent -Percent 4.5 -Message ('PENDING_SESSION_EVIDENCE; action=WAIT_ONLY; evidence={0}' -f $pendingSessionEvidence) -Level WARN
+            }
+            $lastPendingSessionEvidence = $pendingSessionEvidence
         }
         Start-Sleep -Seconds 5
     }
