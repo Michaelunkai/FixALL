@@ -16,7 +16,9 @@
       * no reboot is scheduled or forced by this script;
       * no volume is force-dismounted;
       * no registry reboot marker is deleted or edited;
-      * no component cleanup/reset-base operation is performed.
+      * no /ResetBase operation is performed; optional StartComponentCleanup is
+        opt-in with -RunComponentCleanup and can be explicitly skipped with
+        -SkipComponentCleanup.
 
     Exit codes:
       0    All requested checks passed and final verification is clean.
@@ -33,8 +35,12 @@ param(
     [string]$RepairSource,
     [ValidateRange(1, 720)]
     [int]$ServicingWaitMinutes = 120,
+    [ValidateRange(1, 6)]
+    [int]$MaxRepairRounds = 4,
     [ValidateRange(0, 1024)]
     [int]$MinimumFreeSpaceGB = 2,
+    [switch]$RunComponentCleanup,
+    [switch]$SkipComponentCleanup,
     [switch]$SkipVolumeChecks,
     [switch]$SelfTest,
     [switch]$NoSelfElevation
@@ -42,6 +48,7 @@ param(
 
 $script:Results = @()
 $script:Unresolved = @()
+$script:ProbeFailures = @()
 $script:Clock = $null
 $script:LogPath = $null
 $script:RunId = $null
@@ -144,6 +151,20 @@ function Add-RepairResult {
     }
 }
 
+function Register-ProbeFailure {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    $evidence = '{0}: {1}' -f $Name, $Message
+    if ($script:ProbeFailures -notcontains $evidence) {
+        $script:ProbeFailures += $evidence
+        Add-RepairResult -Name ('Probe ' + $Name) -Verdict 'BLOCKED' -ExitCode 1 -Evidence $Message
+        Write-RepairEvent -Percent $script:LastPercent -Message ('Safety probe failed closed: {0}' -f $evidence) -Level ERROR
+    }
+}
+
 function Get-PendingRebootReasons {
     $reasons = @()
 
@@ -153,27 +174,57 @@ function Get-PendingRebootReasons {
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
     )
     foreach ($path in $registryPaths) {
-        if (Test-Path -LiteralPath $path) {
-            $reasons += $path
+        try {
+            if (Test-Path -LiteralPath $path -ErrorAction Stop) {
+                $reasons += $path
+            }
+        }
+        catch {
+            Register-ProbeFailure -Name 'pending-reboot registry' -Message $_.Exception.Message
+            $reasons += ('Probe failure reading {0}' -f $path)
         }
     }
 
     $sessionManager = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-    if (Test-Path -LiteralPath $sessionManager) {
-        $property = Get-ItemProperty -LiteralPath $sessionManager -ErrorAction SilentlyContinue
-        $pendingRenames = @($property.PendingFileRenameOperations | Where-Object { $null -ne $_ -and $_.ToString().Trim().Length -gt 0 })
-        if ($pendingRenames.Count -gt 0) {
-            $reasons += ('PendingFileRenameOperations ({0} entries)' -f $pendingRenames.Count)
+    try {
+        if (Test-Path -LiteralPath $sessionManager -ErrorAction Stop) {
+            $property = Get-ItemProperty -LiteralPath $sessionManager -ErrorAction Stop
+            $pendingRenames = @($property.PendingFileRenameOperations | Where-Object { $null -ne $_ -and $_.ToString().Trim().Length -gt 0 })
+            # Windows also uses this registry value for ordinary application cleanup
+            # (compiler caches, temporary uploads, and similar files). Only treat
+            # entries that target Windows servicing state as a repair-blocking reboot.
+            $servicingRenames = @($pendingRenames | Where-Object {
+                $_.ToString() -match '(?i)\\Windows\\|\\WinSxS\\|\\servicing\\|\\SystemRoot\\|TrustedInstaller|TiWorker|CBS|pending\.xml'
+            })
+            if ($servicingRenames.Count -gt 0) {
+                $reasons += ('Windows servicing PendingFileRenameOperations ({0} entries)' -f $servicingRenames.Count)
+            }
         }
+    }
+    catch {
+        Register-ProbeFailure -Name 'pending-file-rename registry' -Message $_.Exception.Message
+        $reasons += 'Probe failure reading PendingFileRenameOperations'
     }
 
     $pendingXml = Join-Path $env:windir 'WinSxS\pending.xml'
-    if (Test-Path -LiteralPath $pendingXml) {
-        $reasons += $pendingXml
+    try {
+        if (Test-Path -LiteralPath $pendingXml -ErrorAction Stop) {
+            $reasons += $pendingXml
+        }
+    }
+    catch {
+        Register-ProbeFailure -Name 'pending.xml' -Message $_.Exception.Message
+        $reasons += ('Probe failure reading {0}' -f $pendingXml)
     }
 
-    foreach ($drive in @(Get-PendingOfflineVolumeChecks)) {
-        $reasons += ('Pending offline CHKDSK for {0}' -f $drive)
+    $offlineChecks = @(Get-PendingOfflineVolumeChecks)
+    foreach ($drive in $offlineChecks) {
+        if ($drive -eq '__FIXALL_PROBE_FAILURE__') {
+            $reasons += 'Probe failure reading BootExecute'
+        }
+        else {
+            $reasons += ('Pending offline CHKDSK for {0}' -f $drive)
+        }
     }
 
     return $reasons
@@ -181,19 +232,60 @@ function Get-PendingRebootReasons {
 
 function Get-PendingOfflineVolumeChecks {
     $bootExecutePath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-    $property = Get-ItemProperty -LiteralPath $bootExecutePath -Name BootExecute -ErrorAction SilentlyContinue
-    $pending = @()
-    foreach ($line in @($property.BootExecute)) {
-        if ($line -match '(?i)(?<drive>[A-Z]):\s*$' -and $line -match '(?i)autocheck\s+autochk') {
-            $pending += ($Matches['drive'].ToUpperInvariant() + ':')
+    try {
+        $property = Get-ItemProperty -LiteralPath $bootExecutePath -Name BootExecute -ErrorAction Stop
+        $pending = @()
+        foreach ($line in @($property.BootExecute)) {
+            $text = [string]$line
+            $match = [regex]::Match($text, '(?i)^\s*autocheck\s+autochk\b.*(?<drive>[A-Z]):\s*$')
+            if ($match.Success) {
+                $pending += ($match.Groups['drive'].Value.ToUpperInvariant() + ':')
+            }
         }
+        return @($pending | Select-Object -Unique)
     }
-    return @($pending | Select-Object -Unique)
+    catch {
+        Register-ProbeFailure -Name 'BootExecute' -Message $_.Exception.Message
+        return @('__FIXALL_PROBE_FAILURE__')
+    }
 }
 
 function Get-ActiveServicingProcesses {
     $names = @('TiWorker', 'TrustedInstaller', 'MoUsoCoreWorker', 'UsoClient', 'WaaSMedicAgent')
-    return @(Get-Process -Name $names -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime)
+    try {
+        $processes = @(Get-Process -ErrorAction Stop | Where-Object { $names -contains $_.ProcessName } | Select-Object Id, ProcessName, StartTime)
+        return $processes
+    }
+    catch {
+        Register-ProbeFailure -Name 'servicing-process inventory' -Message $_.Exception.Message
+        return @([pscustomobject]@{ Id = -1; ProcessName = 'ServicingProbeFailure'; StartTime = Get-Date })
+    }
+}
+
+function Get-ServicingActivityFingerprint {
+    $active = @(Get-ActiveServicingProcesses)
+    $parts = @()
+    foreach ($item in $active) {
+        try {
+            $process = Get-Process -Id $item.Id -ErrorAction Stop
+            $parts += ('{0}:{1}:{2}:{3}' -f $item.Id, $process.TotalProcessorTime.Ticks, $process.WorkingSet64, $process.PagedMemorySize64)
+        }
+        catch {
+            Register-ProbeFailure -Name 'servicing-process activity' -Message $_.Exception.Message
+            $parts += ('{0}:probe-failure' -f $item.Id)
+        }
+    }
+
+    $cbsPath = Join-Path $env:windir 'Logs\CBS\CBS.log'
+    try {
+        $cbs = Get-Item -LiteralPath $cbsPath -ErrorAction Stop
+        $cbsPart = if ($cbs) { '{0}:{1}' -f $cbs.LastWriteTimeUtc.Ticks, $cbs.Length } else { 'missing' }
+    }
+    catch {
+        Register-ProbeFailure -Name 'CBS log activity' -Message $_.Exception.Message
+        $cbsPart = 'probe-failure'
+    }
+    return (($parts | Sort-Object) -join '|') + ';CBS=' + $cbsPart
 }
 
 function Wait-ForServicingIdle {
@@ -202,9 +294,19 @@ function Wait-ForServicingIdle {
     $started = $script:Clock.Elapsed.TotalSeconds
     while ($true) {
         $active = @(Get-ActiveServicingProcesses)
+        if ($script:ProbeFailures.Count -gt 0) {
+            Write-RepairEvent -Percent 5 -Message 'Servicing preflight could not be proven safe because a required probe failed.' -Level ERROR
+            return $false
+        }
         if ($active.Count -eq 0) {
             Write-RepairEvent -Percent 5 -Message 'No active Windows servicing process detected.' -Level PASS
             return $true
+        }
+
+        $pendingReasons = @(Get-PendingRebootReasons)
+        if ($script:ProbeFailures.Count -gt 0) {
+            Write-RepairEvent -Percent 5 -Message 'Servicing preflight could not be proven safe because a pending-state probe failed.' -Level ERROR
+            return $false
         }
 
         $elapsedMinutes = (($script:Clock.Elapsed.TotalSeconds - $started) / 60)
@@ -221,19 +323,101 @@ function Wait-ForServicingIdle {
     }
 }
 
-function Get-VolumeInventory {
-    $items = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | Where-Object { $_.FileSystem })
-    $volumes = @()
-    foreach ($item in $items) {
-        $volumes += [pscustomobject]@{
-            Drive      = $item.DeviceID.ToUpperInvariant()
-            FileSystem = $item.FileSystem.ToUpperInvariant()
-            Label      = [string]$item.VolumeName
-            FreeBytes  = [int64]$item.FreeSpace
-            SizeBytes  = [int64]$item.Size
-            FreeGB     = [math]::Round(([double]$item.FreeSpace / 1GB), 2)
-            SizeGB     = [math]::Round(([double]$item.Size / 1GB), 2)
+function Test-RepairPhaseSafety {
+    param([Parameter(Mandatory = $true)][string]$Label)
+
+    $pending = @(Get-PendingRebootReasons)
+    $active = @(Get-ActiveServicingProcesses)
+    if ($script:ProbeFailures.Count -gt 0) {
+        Write-RepairEvent -Percent $script:LastPercent -Message ('{0}: phase guard blocked because a safety probe failed.' -f $Label) -Level ERROR
+        return [pscustomobject]@{ Safe = $false; Verdict = 'BLOCKED'; ExitCode = 1; Evidence = 'A required safety probe failed.' }
+    }
+
+    if ($pending.Count -gt 0) {
+        $evidence = 'Pending reboot state: ' + ($pending -join '; ')
+        Write-RepairEvent -Percent $script:LastPercent -Message ('{0}: phase guard requires reboot before continuing: {1}' -f $Label, ($pending -join '; ')) -Level ERROR
+        return [pscustomobject]@{ Safe = $false; Verdict = 'REBOOT_REQUIRED'; ExitCode = 3010; Evidence = $evidence }
+    }
+
+    if ($active.Count -gt 0) {
+        Write-RepairEvent -Percent $script:LastPercent -Message ('{0}: active servicing workers detected; waiting for a fresh safe boundary.' -f $Label) -Level WARN
+        if (-not (Wait-ForServicingIdle -MaximumMinutes 5)) {
+            Write-RepairEvent -Percent $script:LastPercent -Message ('{0}: phase guard could not prove servicing idle.' -f $Label) -Level ERROR
+            return [pscustomobject]@{ Safe = $false; Verdict = 'BLOCKED'; ExitCode = 1; Evidence = 'Active servicing workers did not reach zero within the phase guard window.' }
         }
+        $pending = @(Get-PendingRebootReasons)
+        $active = @(Get-ActiveServicingProcesses)
+        if ($script:ProbeFailures.Count -gt 0) {
+            Write-RepairEvent -Percent $script:LastPercent -Message ('{0}: phase guard remained unsafe after servicing wait.' -f $Label) -Level ERROR
+            return [pscustomobject]@{ Safe = $false; Verdict = 'BLOCKED'; ExitCode = 1; Evidence = 'A safety probe failed after the servicing wait.' }
+        }
+        if ($pending.Count -gt 0) {
+            $evidence = 'Pending reboot state after servicing wait: ' + ($pending -join '; ')
+            Write-RepairEvent -Percent $script:LastPercent -Message ('{0}: phase guard requires reboot after servicing wait.' -f $Label) -Level ERROR
+            return [pscustomobject]@{ Safe = $false; Verdict = 'REBOOT_REQUIRED'; ExitCode = 3010; Evidence = $evidence }
+        }
+        if ($active.Count -gt 0) {
+            Write-RepairEvent -Percent $script:LastPercent -Message ('{0}: phase guard rejected because servicing workers remain active after the wait.' -f $Label) -Level ERROR
+            return [pscustomobject]@{ Safe = $false; Verdict = 'BLOCKED'; ExitCode = 1; Evidence = 'Servicing workers remained active after the wait.' }
+        }
+    }
+
+    Write-RepairEvent -Percent $script:LastPercent -Message ('{0}: fresh servicing and pending-reboot guard passed.' -f $Label) -Level PASS
+    return [pscustomobject]@{ Safe = $true; Verdict = 'PASS'; ExitCode = 0; Evidence = 'No active servicing process or pending reboot state detected.' }
+}
+
+function Get-VolumeInventory {
+    $volumes = @()
+    $drives = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq [IO.DriveType]::Fixed })
+    foreach ($item in $drives) {
+        $drive = $item.Name.TrimEnd('\').ToUpperInvariant()
+        if (-not $item.IsReady) {
+            $volumes += [pscustomobject]@{
+                Drive      = $drive
+                FileSystem = ''
+                Label      = ''
+                FreeBytes  = [int64]0
+                SizeBytes  = [int64]0
+                FreeGB     = [double]0
+                SizeGB     = [double]0
+                Ready      = $false
+            }
+            continue
+        }
+
+        $label = ''
+        try {
+            $label = [string]$item.VolumeLabel
+            $format = [string]$item.DriveFormat
+            if ([string]::IsNullOrWhiteSpace($format)) {
+                throw ('Filesystem metadata is empty for {0}.' -f $drive)
+            }
+            $volumes += [pscustomobject]@{
+                Drive      = $drive
+                FileSystem = $format.ToUpperInvariant()
+                Label      = $label
+                FreeBytes  = [int64]$item.AvailableFreeSpace
+                SizeBytes  = [int64]$item.TotalSize
+                FreeGB     = [math]::Round(([double]$item.AvailableFreeSpace / 1GB), 2)
+                SizeGB     = [math]::Round(([double]$item.TotalSize / 1GB), 2)
+                Ready      = $true
+            }
+        }
+        catch {
+            $volumes += [pscustomobject]@{
+                Drive      = $drive
+                FileSystem = ''
+                Label      = $label
+                FreeBytes  = [int64]0
+                SizeBytes  = [int64]0
+                FreeGB     = [double]0
+                SizeGB     = [double]0
+                Ready      = $false
+            }
+        }
+    }
+    if ($volumes.Count -eq 0) {
+        throw 'No fixed volumes could be enumerated.'
     }
     return $volumes
 }
@@ -265,6 +449,16 @@ function Read-AppendedNativeOutput {
         while (-not $reader.EndOfStream) {
             $line = $reader.ReadLine()
             if ($null -ne $line) {
+                # SFC can write UTF-16LE text without a BOM.  StreamReader then
+                # exposes embedded NULs; remove them before matching evidence or
+                # displaying progress so a real integrity failure cannot be
+                # mistaken for a clean exit code.
+                if ($line.IndexOf([char]0) -ge 0) {
+                    $line = $line.Replace(([string][char]0), [string]::Empty)
+                }
+                if ($line.IndexOf([char]0xFEFF) -ge 0) {
+                    $line = $line.Replace(([string][char]0xFEFF), [string]::Empty)
+                }
                 [void]$Lines.Add($line)
                 $linePercent = $StartPercent
                 $percentageMatch = [regex]::Match($line, '(?<![\d.])(?<value>\d{1,3}(?:\.\d+)?)%')
@@ -280,7 +474,10 @@ function Read-AppendedNativeOutput {
         $Position.Value = $stream.Position
     }
     catch {
-        # A writer can briefly hold the file between polls; retry on the next heartbeat.
+        $message = 'Could not read native output {0}: {1}' -f $Path, $_.Exception.Message
+        [void]$Lines.Add($message)
+        Write-RepairEvent -Percent $StartPercent -Message $message -Level ERROR
+        throw
     }
     finally {
         if ($reader) {
@@ -299,8 +496,23 @@ function Invoke-NativeTracked {
         [Parameter(Mandatory = $true)][string]$Label,
         [Parameter(Mandatory = $true)][double]$StartPercent,
         [Parameter(Mandatory = $true)][double]$EndPercent,
-        [switch]$Interactive
+        [switch]$Interactive,
+        [switch]$RepairPhase
     )
+
+    if ($RepairPhase) {
+        $safety = Test-RepairPhaseSafety -Label $Label
+        if (-not $safety.Safe) {
+            Write-RepairEvent -Percent $StartPercent -Message ('{0} {1}; {2}' -f $safety.Verdict, $Label, $safety.Evidence) -Level ERROR
+            return [pscustomobject]@{
+                Label     = $Label
+                ExitCode  = $safety.ExitCode
+                Verdict   = $safety.Verdict
+                Lines     = @($safety.Evidence)
+                Evidence  = $safety.Evidence
+            }
+        }
+    }
 
     $argumentText = (($Arguments | ForEach-Object { ConvertTo-QuotedNativeArgument -Value $_ }) -join ' ')
     Write-RepairEvent -Percent $StartPercent -Message ('START {0} {1} {2}' -f $FilePath, $argumentText, $(if ($Interactive) { '[interactive]' } else { '[captured]' })) -Level INFO
@@ -323,7 +535,14 @@ function Invoke-NativeTracked {
                 Start-Sleep -Milliseconds 250
                 $process.Refresh()
             }
-            $exitCode = $process.ExitCode
+            $process.WaitForExit()
+            $process.Refresh()
+            if ($null -eq $process.ExitCode) {
+                $exitCode = 9009
+            }
+            else {
+                $exitCode = [int]$process.ExitCode
+            }
         }
         else {
             $token = [Guid]::NewGuid().ToString('N')
@@ -415,7 +634,7 @@ function Invoke-DismPhase {
         $arguments += '/LimitAccess'
         Write-RepairEvent -Percent $StartPercent -Message ('Using explicit repair source: {0}' -f $RepairSource) -Level INFO
     }
-    $result = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\Dism.exe') -Arguments $arguments -Label $Label -StartPercent $StartPercent -EndPercent $EndPercent
+    $result = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\Dism.exe') -Arguments $arguments -Label $Label -StartPercent $StartPercent -EndPercent $EndPercent -RepairPhase
     $verdict = $result.Verdict
     if ($verdict -eq 'FAIL' -and $Label -notmatch '(?i)final') {
         $verdict = 'ATTENTION'
@@ -432,10 +651,13 @@ function Invoke-SfcPhase {
         [Parameter(Mandatory = $true)][double]$EndPercent
     )
 
-    $result = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\sfc.exe') -Arguments @($Operation) -Label $Label -StartPercent $StartPercent -EndPercent $EndPercent
-    $unresolvedText = @($result.Lines | Where-Object { $_ -match '(?i)could not|unable to fix|unable to repair|found corrupt files but was unable' })
+    $result = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\sfc.exe') -Arguments @($Operation) -Label $Label -StartPercent $StartPercent -EndPercent $EndPercent -RepairPhase
+    $unresolvedText = @($result.Lines | Where-Object { $_ -match '(?i)Windows Resource Protection found (?:corrupt files|integrity violations)|found corrupt files but was unable|could not start the repair service|unable to fix|unable to repair|could not repair|repairs, details are included' })
     $verdict = $result.Verdict
-    if ($Operation -eq '/verifyonly' -and ($result.ExitCode -ne 0 -or $unresolvedText.Count -gt 0)) {
+    if ($result.Verdict -in @('BLOCKED', 'REBOOT_REQUIRED')) {
+        $verdict = $result.Verdict
+    }
+    elseif ($Operation -eq '/verifyonly' -and ($result.ExitCode -ne 0 -or $unresolvedText.Count -gt 0)) {
         $verdict = 'UNRESOLVED'
     }
     elseif ($Operation -eq '/scannow' -and $unresolvedText.Count -gt 0) {
@@ -452,6 +674,40 @@ function Invoke-SfcPhase {
     return $result
 }
 
+function Test-NativeResultUnsafe {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($Result.Verdict -in @('BLOCKED', 'REBOOT_REQUIRED')) {
+        Add-RepairResult -Name $Name -Verdict $Result.Verdict -ExitCode $Result.ExitCode -Evidence $Result.Evidence
+        return $true
+    }
+    return $false
+}
+
+function Stop-IfRepairUnsafe {
+    $unsafe = @($script:Results | Where-Object { $_.Verdict -in @('BLOCKED', 'REBOOT_REQUIRED') })
+    if ($unsafe.Count -gt 0) {
+        $reboot = @($unsafe | Where-Object { $_.Verdict -eq 'REBOOT_REQUIRED' }).Count -gt 0
+        $hardFailure = @($script:Results | Where-Object { $_.Verdict -in @('FAIL', 'UNRESOLVED', 'BLOCKED', 'SKIPPED_LOW_SPACE') }).Count -gt 0
+        $code = if ($reboot -and -not $hardFailure) { 3010 } else { 1 }
+        Write-RepairEvent -Percent $script:LastPercent -Message 'Stopping before the next phase because a safety gate returned BLOCKED or REBOOT_REQUIRED.' -Level ERROR
+        Write-FinalSummary -ExitCode $code
+        exit $code
+    }
+}
+
+function Test-SfcNeedsAttention {
+    param([AllowNull()][object[]]$Lines)
+
+    $attention = @($Lines | Where-Object {
+        $_ -match '(?i)Windows Resource Protection found (?:corrupt files|integrity violations)|found corrupt files but was unable|could not start the repair service|unable to fix|unable to repair|could not repair|repairs, details are included'
+    })
+    return ($attention.Count -gt 0)
+}
+
 function Invoke-VolumeCheck {
     param(
         [Parameter(Mandatory = $true)]$Volume,
@@ -462,10 +718,13 @@ function Invoke-VolumeCheck {
     $drive = $Volume.Drive
     $label = 'CHKDSK {0}' -f $drive
     $minimumBytes = [int64]$MinimumFreeSpaceGB * 1GB
-    if ($Volume.FreeBytes -lt $minimumBytes) {
+    if ($Volume.FileSystem -eq 'NTFS' -and $Volume.FreeBytes -lt $minimumBytes) {
         $evidence = 'Only {0} GB free; online /scan may not create shadow-copy data. Falling back to interactive /f.' -f $Volume.FreeGB
         Write-RepairEvent -Percent $StartPercent -Message ($label + ': ' + $evidence) -Level WARN
-        $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' low-space /f') -StartPercent $StartPercent -EndPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.78)) -Interactive
+        $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' low-space /f') -StartPercent $StartPercent -EndPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.78)) -Interactive -RepairPhase
+        if (Test-NativeResultUnsafe -Result $fix -Name $label) {
+            return
+        }
         $repairNeedsReboot = ($fix.ExitCode -eq 3010) -or @($fix.Lines | Where-Object { $_ -match '(?i)schedule.*next restart|reboot|restart' }).Count -gt 0
         $repairNeedsReboot = $repairNeedsReboot -or @((Get-PendingOfflineVolumeChecks) | Where-Object { $_ -eq $drive }).Count -gt 0
         if ($repairNeedsReboot) {
@@ -476,7 +735,10 @@ function Invoke-VolumeCheck {
             Add-RepairResult -Name $label -Verdict 'FAIL' -ExitCode $fix.ExitCode -Evidence $fix.Evidence
             return
         }
-        $dirty = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\fsutil.exe') -Arguments @('dirty', 'query', $drive) -Label ($label + ' dirty-bit verification') -StartPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.78)) -EndPercent $EndPercent
+        $dirty = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\fsutil.exe') -Arguments @('dirty', 'query', $drive) -Label ($label + ' dirty-bit verification') -StartPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.78)) -EndPercent $EndPercent -RepairPhase
+        if (Test-NativeResultUnsafe -Result $dirty -Name ($label + ' dirty-bit verification')) {
+            return
+        }
         $cleanDirtyBit = ($dirty.ExitCode -eq 0) -and @($dirty.Lines | Where-Object { $_ -match '(?i)not dirty|is not dirty' }).Count -gt 0
         if ($cleanDirtyBit) {
             Add-RepairResult -Name $label -Verdict 'PASS' -ExitCode $fix.ExitCode -Evidence ('/f completed and the volume dirty bit is clear; online /scan was unavailable because free space was {0} GB.' -f $Volume.FreeGB)
@@ -488,7 +750,10 @@ function Invoke-VolumeCheck {
     }
 
     if ($Volume.FileSystem -eq 'NTFS') {
-        $scan = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/scan') -Label ($label + ' /scan') -StartPercent $StartPercent -EndPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.55))
+        $scan = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/scan') -Label ($label + ' /scan') -StartPercent $StartPercent -EndPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.55)) -RepairPhase
+        if (Test-NativeResultUnsafe -Result $scan -Name ($label + ' /scan')) {
+            return
+        }
         $scanNeedsRepair = ($scan.ExitCode -notin @(0, 1)) -or @($scan.Lines | Where-Object { $_ -match '(?i)found problems|run chkdsk|spotfix|corrupt' }).Count -gt 0
         $spaceFailure = @($scan.Lines | Where-Object { $_ -match '(?i)insufficient storage|shadow copy' }).Count -gt 0
 
@@ -501,7 +766,10 @@ function Invoke-VolumeCheck {
 
         if ($scanNeedsRepair) {
             Write-RepairEvent -Percent ($StartPercent + (($EndPercent - $StartPercent) * 0.55)) -Message ($label + ': online scan indicates repair is needed; launching interactive /f without force-dismount.') -Level WARN
-            $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' /f') -StartPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.55)) -EndPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.82)) -Interactive
+            $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' /f') -StartPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.55)) -EndPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.82)) -Interactive -RepairPhase
+            if (Test-NativeResultUnsafe -Result $fix -Name ($label + ' /f')) {
+                return
+            }
             $offlinePending = @((Get-PendingOfflineVolumeChecks) | Where-Object { $_ -eq $drive }).Count -gt 0
             if ($fix.ExitCode -eq 3010 -or $offlinePending -or @($fix.Lines | Where-Object { $_ -match '(?i)schedule.*next restart|reboot' }).Count -gt 0) {
                 $script:Unresolved += ('{0}: offline repair requires a reboot.' -f $label)
@@ -514,7 +782,10 @@ function Invoke-VolumeCheck {
             }
         }
 
-        $final = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/scan') -Label ($label + ' final /scan') -StartPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.82)) -EndPercent $EndPercent
+        $final = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/scan') -Label ($label + ' final /scan') -StartPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.82)) -EndPercent $EndPercent -RepairPhase
+        if (Test-NativeResultUnsafe -Result $final -Name ($label + ' final /scan')) {
+            return
+        }
         $clean = ($final.ExitCode -in @(0, 1)) -and @($final.Lines | Where-Object { $_ -match '(?i)found no problems|no further action is required' }).Count -gt 0
         if ($clean) {
             Add-RepairResult -Name $label -Verdict 'PASS' -ExitCode $final.ExitCode -Evidence $final.Evidence
@@ -523,21 +794,38 @@ function Invoke-VolumeCheck {
             Add-RepairResult -Name $label -Verdict 'UNRESOLVED' -ExitCode $final.ExitCode -Evidence $final.Evidence
         }
     }
+    elseif ($Volume.FileSystem -notin @('EXFAT', 'FAT', 'FAT32', 'UDF')) {
+        $evidence = 'Filesystem type {0} is outside the verified CHKDSK non-NTFS allowlist.' -f $Volume.FileSystem
+        Add-RepairResult -Name $label -Verdict 'UNRESOLVED' -ExitCode 2 -Evidence $evidence
+        Write-RepairEvent -Percent $StartPercent -Message ($label + ': ' + $evidence) -Level ERROR
+    }
     else {
         Write-RepairEvent -Percent $StartPercent -Message ('{0}: {1} uses a non-NTFS filesystem; using /f with an interactive console.' -f $label, $Volume.FileSystem) -Level WARN
-        $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' /f') -StartPercent $StartPercent -EndPercent $EndPercent -Interactive
+        $fixEnd = $StartPercent + (($EndPercent - $StartPercent) * 0.55)
+        $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' /f') -StartPercent $StartPercent -EndPercent $fixEnd -Interactive -RepairPhase
+        if (Test-NativeResultUnsafe -Result $fix -Name ($label + ' /f')) {
+            return
+        }
         $offlinePending = @((Get-PendingOfflineVolumeChecks) | Where-Object { $_ -eq $drive }).Count -gt 0
         if ($offlinePending -or $fix.ExitCode -eq 3010) {
             Add-RepairResult -Name $label -Verdict 'REBOOT_REQUIRED' -ExitCode 3010 -Evidence 'Offline CHKDSK was scheduled or reported that a reboot is required.'
         }
-        elseif ($fix.ExitCode -in @(0, 1)) {
-            Add-RepairResult -Name $label -Verdict 'PASS' -ExitCode $fix.ExitCode -Evidence $fix.Evidence
-        }
-        elseif ($fix.ExitCode -eq 3010) {
-            Add-RepairResult -Name $label -Verdict 'REBOOT_REQUIRED' -ExitCode $fix.ExitCode -Evidence 'Filesystem repair reported that a reboot is required.'
+        elseif ($fix.ExitCode -notin @(0, 1)) {
+            Add-RepairResult -Name $label -Verdict 'FAIL' -ExitCode $fix.ExitCode -Evidence $fix.Evidence
         }
         else {
-            Add-RepairResult -Name $label -Verdict 'UNRESOLVED' -ExitCode $fix.ExitCode -Evidence $fix.Evidence
+            $verify = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' final /f verification') -StartPercent $fixEnd -EndPercent $EndPercent -Interactive -RepairPhase
+            if (Test-NativeResultUnsafe -Result $verify -Name ($label + ' final /f verification')) {
+                return
+            }
+            $cleanEvidence = @($verify.Lines | Where-Object { $_ -match '(?i)found no problems|no problems found|no further action is required|no errors found|no errors were found' })
+            $errorEvidence = @($verify.Lines | Where-Object { $_ -match '(?i)found problems|corrupt|bad sectors|could not|unable' })
+            if ($verify.ExitCode -in @(0, 1) -and $cleanEvidence.Count -gt 0 -and $errorEvidence.Count -eq 0) {
+                Add-RepairResult -Name $label -Verdict 'PASS' -ExitCode $verify.ExitCode -Evidence (($cleanEvidence | Select-Object -Last 2) -join ' | ')
+            }
+            else {
+                Add-RepairResult -Name $label -Verdict 'UNRESOLVED' -ExitCode $verify.ExitCode -Evidence $verify.Evidence
+            }
         }
     }
 }
@@ -607,7 +895,20 @@ $script:LogPath = Join-Path $logRoot ('FixALL-{0}.log' -f $script:RunId)
 New-Item -ItemType File -Path $script:LogPath -Force | Out-Null
 
 Write-RepairEvent -Percent 0 -Message ('FixALL started; PowerShell {0}; PID {1}; run {2}' -f $PSVersionTable.PSVersion, $PID, $script:RunId) -Level INFO
-Write-RepairEvent -Percent 1 -Message ('OS: {0}; build {1}; system drive {2}' -f (Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption), (Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber), $env:SystemDrive) -Level INFO
+$osCaption = 'Windows'
+$osBuild = 'unknown'
+try {
+    $osKey = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+    if ($osKey.ProductName) { $osCaption = [string]$osKey.ProductName }
+    if ($osKey.CurrentBuild) {
+        $osBuild = [string]$osKey.CurrentBuild
+        if ($null -ne $osKey.UBR) { $osBuild += ('.{0}' -f $osKey.UBR) }
+    }
+}
+catch {
+    Register-ProbeFailure -Name 'OS metadata' -Message $_.Exception.Message
+}
+Write-RepairEvent -Percent 1 -Message ('OS: {0}; build {1}; system drive {2}' -f $osCaption, $osBuild, $env:SystemDrive) -Level INFO
 
 if ($SelfTest) {
     $script:CurrentStage = 'self-test'
@@ -675,6 +976,14 @@ try {
         $volumes = @($allVolumes)
     }
 
+    if ($volumes.Count -eq 0) {
+        Add-RepairResult -Name 'Selected volumes' -Verdict 'BLOCKED' -ExitCode 2 -Evidence 'No selected fixed filesystem volume could be verified.'
+    }
+    $invalidVolumes = @($volumes | Where-Object { -not $_.Ready -or [string]::IsNullOrWhiteSpace([string]$_.FileSystem) })
+    foreach ($invalidVolume in $invalidVolumes) {
+        Add-RepairResult -Name ('Volume ' + $invalidVolume.Drive + ' metadata') -Verdict 'BLOCKED' -ExitCode 2 -Evidence 'The selected fixed volume was not ready or did not expose verifiable filesystem metadata.'
+    }
+
     $volumes = @($volumes | Sort-Object @{Expression = { if ($_.Drive -eq $env:SystemDrive.ToUpperInvariant()) { 0 } else { 1 } }}, Drive)
     foreach ($volume in $volumes) {
         Write-RepairEvent -Percent 8 -Message ('Selected volume: {0} {1} label="{2}" free={3} GB size={4} GB' -f $volume.Drive, $volume.FileSystem, $volume.Label, $volume.FreeGB, $volume.SizeGB) -Level INFO
@@ -695,15 +1004,40 @@ if (-not $activeIdle -or $pendingReasons.Count -gt 0 -or @($script:Results | Whe
 
 $script:CurrentStage = 'component-store'
 $dismCheck = Invoke-DismPhase -Operation '/CheckHealth' -Label 'DISM CheckHealth (initial)' -StartPercent 10 -EndPercent 15
+Stop-IfRepairUnsafe
 $dismScan = Invoke-DismPhase -Operation '/ScanHealth' -Label 'DISM ScanHealth' -StartPercent 15 -EndPercent 28
+Stop-IfRepairUnsafe
 $dismRestore = Invoke-DismPhase -Operation '/RestoreHealth' -Label 'DISM RestoreHealth' -StartPercent 28 -EndPercent 55 -Repair
+Stop-IfRepairUnsafe
+
+if ($SkipComponentCleanup -or -not $RunComponentCleanup) {
+    $cleanupReason = if ($SkipComponentCleanup) { 'explicit -SkipComponentCleanup' } else { 'default safety policy; use -RunComponentCleanup to opt in' }
+    Add-RepairResult -Name 'DISM StartComponentCleanup' -Verdict 'SKIPPED' -ExitCode 0 -Evidence ('Skipped by {0}.' -f $cleanupReason)
+    Write-RepairEvent -Percent 55 -Message ('Component cleanup skipped by {0}.' -f $cleanupReason) -Level WARN
+}
+else {
+    $dismCleanup = Invoke-DismPhase -Operation '/StartComponentCleanup' -Label 'DISM StartComponentCleanup' -StartPercent 55 -EndPercent 58
+    Stop-IfRepairUnsafe
+}
 
 $script:CurrentStage = 'system-files'
-$sfcScan = Invoke-SfcPhase -Operation '/scannow' -Label 'SFC scannow (first pass)' -StartPercent 55 -EndPercent 72
-if ($sfcScan.ExitCode -ne 0 -or @($sfcScan.Lines | Where-Object { $_ -match '(?i)could not|unable to fix|unable to repair|found corrupt files but was unable' }).Count -gt 0) {
-    Write-RepairEvent -Percent 72 -Message 'SFC reported attention is needed; repeating DISM RestoreHealth then SFC.' -Level WARN
-    $dismRetry = Invoke-DismPhase -Operation '/RestoreHealth' -Label 'DISM RestoreHealth (retry)' -StartPercent 72 -EndPercent 82 -Repair
-    $sfcRetry = Invoke-SfcPhase -Operation '/scannow' -Label 'SFC scannow (retry)' -StartPercent 82 -EndPercent 88
+$repairStart = 58.0
+$repairEnd = 88.0
+$repairSpan = ($repairEnd - $repairStart) / [double]$MaxRepairRounds
+$sfcScan = Invoke-SfcPhase -Operation '/scannow' -Label 'SFC scannow (round 1)' -StartPercent $repairStart -EndPercent ($repairStart + $repairSpan)
+Stop-IfRepairUnsafe
+$sfcNeedsAttention = ($sfcScan.ExitCode -ne 0) -or (Test-SfcNeedsAttention -Lines $sfcScan.Lines)
+
+for ($round = 2; $round -le $MaxRepairRounds -and $sfcNeedsAttention; $round++) {
+    $roundStart = $repairStart + (($round - 1) * $repairSpan)
+    $dismEnd = $roundStart + ($repairSpan * 0.60)
+    $sfcEnd = $repairStart + ($round * $repairSpan)
+    Write-RepairEvent -Percent $roundStart -Message ('SFC still reports attention; starting guarded repair round {0}/{1}: DISM RestoreHealth then SFC.' -f $round, $MaxRepairRounds) -Level WARN
+    $dismRetry = Invoke-DismPhase -Operation '/RestoreHealth' -Label ('DISM RestoreHealth (round {0})' -f $round) -StartPercent $roundStart -EndPercent $dismEnd -Repair
+    Stop-IfRepairUnsafe
+    $sfcRetry = Invoke-SfcPhase -Operation '/scannow' -Label ('SFC scannow (round {0})' -f $round) -StartPercent $dismEnd -EndPercent $sfcEnd
+    Stop-IfRepairUnsafe
+    $sfcNeedsAttention = ($sfcRetry.ExitCode -ne 0) -or (Test-SfcNeedsAttention -Lines $sfcRetry.Lines)
 }
 
 $script:CurrentStage = 'filesystem'
@@ -718,12 +1052,15 @@ else {
         $start = 88 + ((($index - 1) / $volumeCount) * 9)
         $end = 88 + (($index / $volumeCount) * 9)
         Invoke-VolumeCheck -Volume $volume -StartPercent $start -EndPercent $end
+        Stop-IfRepairUnsafe
     }
 }
 
 $script:CurrentStage = 'final-verification'
 $finalDism = Invoke-DismPhase -Operation '/CheckHealth' -Label 'DISM CheckHealth (final)' -StartPercent 97 -EndPercent 98.2
+Stop-IfRepairUnsafe
 $finalSfc = Invoke-SfcPhase -Operation '/verifyonly' -Label 'SFC verifyonly (final)' -StartPercent 98.2 -EndPercent 99.2
+Stop-IfRepairUnsafe
 $finalPending = @(Get-PendingRebootReasons)
 $finalActive = @(Get-ActiveServicingProcesses)
 if ($finalPending.Count -gt 0) {
@@ -743,7 +1080,7 @@ else {
 $hardFailure = @($script:Results | Where-Object { $_.Verdict -in @('FAIL', 'UNRESOLVED', 'BLOCKED', 'SKIPPED_LOW_SPACE') }).Count -gt 0
 $rebootRequired = @($script:Results | Where-Object { $_.Verdict -eq 'REBOOT_REQUIRED' }).Count -gt 0
 $finalDismClean = ($finalDism.ExitCode -eq 0) -and (@($finalDism.Lines | Where-Object { $_ -match '(?i)no component store corruption' }).Count -gt 0)
-$finalSfcClean = ($finalSfc.ExitCode -eq 0) -and (@($finalSfc.Lines | Where-Object { $_ -match '(?i)did not find any integrity violations|did not find any integrity violation' }).Count -gt 0)
+$finalSfcClean = ($finalSfc.ExitCode -eq 0) -and (@($finalSfc.Lines | Where-Object { $_ -match '(?i)Windows Resource Protection did not find any integrity violations' }).Count -gt 0) -and (@($finalSfc.Lines | Where-Object { $_ -match '(?i)Windows Resource Protection found (?:corrupt files|integrity violations)|found corrupt files but was unable|could not start the repair service|unable to fix|unable to repair|could not repair' }).Count -eq 0)
 if (-not $finalDismClean) {
     Add-RepairResult -Name 'Final DISM clean-evidence gate' -Verdict 'UNRESOLVED' -ExitCode $finalDism.ExitCode -Evidence 'Final CheckHealth did not provide a clean component-store result.'
 }
