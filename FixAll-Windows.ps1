@@ -59,6 +59,53 @@ $script:NativeOutputLinesSeen = 0
 $script:NativeOutputCharsSeen = 0
 $script:LastNativeReportedPercent = $null
 $script:NativeOutputMode = 'NOT_STARTED'
+$script:RepairMutex = $null
+$script:RepairMutexAcquired = $false
+$script:RepairMutexName = 'Global\FixALL-Windows-Repair'
+$script:RepairMutexFailureReason = $null
+
+function Try-AcquireRepairMutex {
+    try {
+        $script:RepairMutex = New-Object System.Threading.Mutex($false, $script:RepairMutexName)
+        try {
+            $acquired = $script:RepairMutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # An abandoned mutex is now owned by this process; the previous
+            # owner terminated and Windows released the synchronization object.
+            $acquired = $true
+        }
+
+        if (-not $acquired) {
+            $script:RepairMutexFailureReason = 'Another FixALL instance owns the named mutex.'
+            $script:RepairMutex.Dispose()
+            $script:RepairMutex = $null
+            return $false
+        }
+
+        $script:RepairMutexAcquired = $true
+        return $true
+    }
+    catch {
+        $script:RepairMutexFailureReason = $_.Exception.Message
+        if ($script:RepairMutex) {
+            $script:RepairMutex.Dispose()
+            $script:RepairMutex = $null
+        }
+        return $false
+    }
+}
+
+function Release-RepairMutex {
+    if ($script:RepairMutex) {
+        if ($script:RepairMutexAcquired) {
+            try { $script:RepairMutex.ReleaseMutex() } catch { }
+        }
+        try { $script:RepairMutex.Dispose() } catch { }
+    }
+    $script:RepairMutex = $null
+    $script:RepairMutexAcquired = $false
+}
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -103,7 +150,7 @@ function Write-RepairEvent {
         [string]$Level = 'INFO'
     )
 
-    if ($Percent -lt $script:LastPercent -and $Level -notin @('WARN', 'ERROR')) {
+    if ($Percent -lt $script:LastPercent) {
         $Percent = $script:LastPercent
     }
 
@@ -630,6 +677,10 @@ function Invoke-NativeTracked {
     $script:LastNativeReportedPercent = $null
     $nativeProcessId = 0
     $nativePidPath = $null
+    $process = $null
+    $nativeJob = $null
+    $stdoutPath = $null
+    $stderrPath = $null
 
     try {
         if ($Interactive) {
@@ -713,8 +764,6 @@ function Invoke-NativeTracked {
                 [void]$lines.Add([string]$jobReason)
                 $exitCode = 9009
             }
-            Remove-Job -Job $nativeJob -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $stdoutPath, $stderrPath, $nativePidPath -Force -ErrorAction SilentlyContinue
         }
     }
     catch {
@@ -722,6 +771,51 @@ function Invoke-NativeTracked {
         [void]$lines.Add($message)
         Write-RepairEvent -Percent $StartPercent -Message ('Could not execute {0}: {1}' -f $Label, $message) -Level ERROR
         $exitCode = 9009
+    }
+    finally {
+        # Never leave an interactive repair process or captured child running
+        # after an output/host exception.  Wait for graceful native completion;
+        # do not force-terminate Windows repair tools from this cleanup path.
+        if ($process) {
+            try {
+                $process.Refresh()
+                while (-not $process.HasExited) {
+                    Start-Sleep -Milliseconds 500
+                    $process.Refresh()
+                }
+                $process.WaitForExit()
+                if ($exitCode -eq 9009 -and $null -ne $process.ExitCode) {
+                    $exitCode = [int]$process.ExitCode
+                }
+            }
+            catch {
+                # Preserve the original failure evidence.
+            }
+        }
+
+        if ($nativeJob) {
+            try {
+                if ($nativeJob.State -in @('NotStarted', 'Running')) {
+                    Wait-Job -Job $nativeJob -ErrorAction SilentlyContinue | Out-Null
+                }
+                if ($exitCode -eq 9009 -and $nativeJob.State -eq 'Completed') {
+                    $received = @(Receive-Job -Job $nativeJob -ErrorAction SilentlyContinue)
+                    $nativeExit = $received | Where-Object { $_ -is [int] -or $_ -is [long] } | Select-Object -Last 1
+                    if ($null -ne $nativeExit) {
+                        $exitCode = [int]$nativeExit
+                    }
+                }
+            }
+            catch {
+                # Preserve the original failure evidence.
+            }
+            Remove-Job -Job $nativeJob -Force -ErrorAction SilentlyContinue
+        }
+
+        $temporaryPaths = @($stdoutPath, $stderrPath, $nativePidPath) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+        if ($temporaryPaths.Count -gt 0) {
+            Remove-Item -LiteralPath $temporaryPaths -Force -ErrorAction SilentlyContinue
+        }
     }
 
     $verdict = if ($exitCode -eq 0) { 'PASS' } elseif ($exitCode -eq 3010) { 'REBOOT_REQUIRED' } else { 'FAIL' }
@@ -731,7 +825,8 @@ function Invoke-NativeTracked {
     $evidence = if ($lines.Count -gt 0) { ($lines | Select-Object -Last 3) -join ' | ' } else { 'No captured native text; see native system logs.' }
     $finalOutputAge = if ($null -eq $script:LastNativeOutputAtUtc) { 'unknown' } else { '{0}s' -f [math]::Max(0, [int](([DateTime]::UtcNow - $script:LastNativeOutputAtUtc).TotalSeconds)) }
     $finalNativePercent = if ($null -eq $script:LastNativeReportedPercent) { 'unknown' } else { '{0:0.00}%' -f $script:LastNativeReportedPercent }
-    Write-RepairEvent -Percent $EndPercent -Message ('END {0}; exit={1}; verdict={2}; nativeProgress={3}; lastNativeOutputAge={4}; outputLines={5}; outputChars={6}; watchdog=COMPLETE' -f $Label, $exitCode, $verdict, $finalNativePercent, $finalOutputAge, $script:NativeOutputLinesSeen, $script:NativeOutputCharsSeen) -Level $(if ($verdict -eq 'PASS') { 'PASS' } elseif ($verdict -eq 'REBOOT_REQUIRED') { 'WARN' } else { 'ERROR' })
+    $endPercentForEvent = if ($verdict -eq 'PASS') { $EndPercent } else { $script:LastPercent }
+    Write-RepairEvent -Percent $endPercentForEvent -Message ('END {0}; exit={1}; verdict={2}; nativeProgress={3}; lastNativeOutputAge={4}; outputLines={5}; outputChars={6}; watchdog=COMPLETE' -f $Label, $exitCode, $verdict, $finalNativePercent, $finalOutputAge, $script:NativeOutputLinesSeen, $script:NativeOutputCharsSeen) -Level $(if ($verdict -eq 'PASS') { 'PASS' } elseif ($verdict -eq 'REBOOT_REQUIRED') { 'WARN' } else { 'ERROR' })
 
     return [pscustomobject]@{
         Label     = $Label
@@ -818,6 +913,7 @@ function Stop-IfRepairUnsafe {
         $code = if ($reboot -and -not $hardFailure) { 3010 } else { 1 }
         Write-RepairEvent -Percent $script:LastPercent -Message 'Stopping before the next phase because a safety gate returned BLOCKED or REBOOT_REQUIRED.' -Level ERROR
         Write-FinalSummary -ExitCode $code
+        Release-RepairMutex
         exit $code
     }
 }
@@ -1026,6 +1122,14 @@ New-Item -ItemType File -Path $script:LogPath -Force | Out-Null
 
 Write-RepairEvent -Percent 0 -Message ('FixALL started; PowerShell {0}; PID {1}; run {2}' -f $PSVersionTable.PSVersion, $PID, $script:RunId) -Level INFO
 Write-RepairEvent -Percent 0 -Message 'Observability enabled: millisecond timestamps; phase progress; native output age; process liveness; servicing activity fingerprint; and explicit safe-stall/watchdog classification.' -Level INFO
+if (-not (Try-AcquireRepairMutex)) {
+    $mutexEvidence = '{0} Mutex={1}' -f $script:RepairMutexFailureReason, $script:RepairMutexName
+    Add-RepairResult -Name 'FixALL instance serialization' -Verdict 'BLOCKED' -ExitCode 1 -Evidence $mutexEvidence
+    Write-RepairEvent -Percent 0 -Message ('Refusing to start a concurrent or unacquirable repair run: {0}' -f $mutexEvidence) -Level ERROR
+    Write-FinalSummary -ExitCode 1
+    exit 1
+}
+Write-RepairEvent -Percent 0 -Message ('Instance serialization acquired; concurrent repair launch is blocked by mutex {0}.' -f $script:RepairMutexName) -Level PASS
 $osCaption = 'Windows'
 $osBuild = 'unknown'
 try {
@@ -1070,8 +1174,10 @@ if ($SelfTest) {
     else {
         Add-RepairResult -Name 'Native process capture' -Verdict 'FAIL' -ExitCode $nativeSelfTest.ExitCode -Evidence 'Did not capture expected native stdout.'
     }
-    Write-FinalSummary -ExitCode $(if ($script:Unresolved.Count -eq 0) { 0 } else { 1 }) -SelfTestMode
-    exit $(if ($script:Unresolved.Count -eq 0) { 0 } else { 1 })
+    $selfTestExit = if ($script:Unresolved.Count -eq 0) { 0 } else { 1 }
+    Write-FinalSummary -ExitCode $selfTestExit -SelfTestMode
+    Release-RepairMutex
+    exit $selfTestExit
 }
 
 $script:CurrentStage = 'preflight'
@@ -1127,9 +1233,10 @@ catch {
 
 if (-not $activeIdle -or $pendingReasons.Count -gt 0 -or @($script:Results | Where-Object { $_.Verdict -eq 'BLOCKED' }).Count -gt 0) {
     Write-RepairEvent -Percent 10 -Message 'Repair phases were intentionally not launched because preflight found an unsafe or unresolved state.' -Level ERROR
-    $onlyReboot = ($pendingReasons.Count -gt 0 -and $script:Unresolved.Count -eq 1 -and $script:Unresolved[0] -like 'Pending-reboot preflight:*')
+    $onlyReboot = ($activeIdle -and $pendingReasons.Count -gt 0 -and $script:Unresolved.Count -eq 1 -and $script:Unresolved[0] -like 'Pending-reboot preflight:*')
     $preflightExit = if ($onlyReboot) { 3010 } else { 1 }
     Write-FinalSummary -ExitCode $preflightExit
+    Release-RepairMutex
     exit $preflightExit
 }
 
@@ -1219,6 +1326,20 @@ if (-not $finalSfcClean) {
     Add-RepairResult -Name 'Final SFC clean-evidence gate' -Verdict 'UNRESOLVED' -ExitCode $finalSfc.ExitCode -Evidence 'Final verifyonly did not provide a clean integrity result.'
 }
 
+$historicalAttention = @($script:Results | Where-Object { $_.Verdict -eq 'ATTENTION' })
+if ($historicalAttention.Count -gt 0) {
+    if ($finalDismClean -and $finalSfcClean) {
+        foreach ($attention in $historicalAttention) {
+            $attention.Verdict = 'RESOLVED_AFTER_FINAL_VERIFICATION'
+        }
+        Write-RepairEvent -Percent $script:LastPercent -Message ('{0} earlier repair phase attention result(s) were superseded by clean final DISM and SFC evidence.' -f $historicalAttention.Count) -Level PASS
+    }
+    else {
+        $attentionEvidence = ($historicalAttention | ForEach-Object { '{0}: {1}' -f $_.Name, $_.Evidence }) -join ' | '
+        Add-RepairResult -Name 'Historical repair attention' -Verdict 'UNRESOLVED' -ExitCode 1 -Evidence ('Earlier repair phase(s) reported attention and final clean evidence was not complete: ' + $attentionEvidence)
+    }
+}
+
 $hardFailure = @($script:Results | Where-Object { $_.Verdict -in @('FAIL', 'UNRESOLVED', 'BLOCKED', 'SKIPPED_LOW_SPACE') }).Count -gt 0
 $rebootRequired = @($script:Results | Where-Object { $_.Verdict -eq 'REBOOT_REQUIRED' }).Count -gt 0
 $exitCode = if ($hardFailure) { 1 } elseif ($rebootRequired) { 3010 } else { 0 }
@@ -1229,4 +1350,5 @@ else {
     Write-RepairEvent -Percent $(if ($exitCode -eq 3010) { 99.5 } else { 99 }) -Message 'The success gate was not satisfied; returning unresolved state instead of claiming a universal fix.' -Level ERROR
 }
 Write-FinalSummary -ExitCode $exitCode
+Release-RepairMutex
 exit $exitCode
