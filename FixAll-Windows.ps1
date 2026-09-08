@@ -784,9 +784,6 @@ function Invoke-NativeTracked {
                     $process.Refresh()
                 }
                 $process.WaitForExit()
-                if ($exitCode -eq 9009 -and $null -ne $process.ExitCode) {
-                    $exitCode = [int]$process.ExitCode
-                }
             }
             catch {
                 # Preserve the original failure evidence.
@@ -797,13 +794,6 @@ function Invoke-NativeTracked {
             try {
                 if ($nativeJob.State -in @('NotStarted', 'Running')) {
                     Wait-Job -Job $nativeJob -ErrorAction SilentlyContinue | Out-Null
-                }
-                if ($exitCode -eq 9009 -and $nativeJob.State -eq 'Completed') {
-                    $received = @(Receive-Job -Job $nativeJob -ErrorAction SilentlyContinue)
-                    $nativeExit = $received | Where-Object { $_ -is [int] -or $_ -is [long] } | Select-Object -Last 1
-                    if ($null -ne $nativeExit) {
-                        $exitCode = [int]$nativeExit
-                    }
                 }
             }
             catch {
