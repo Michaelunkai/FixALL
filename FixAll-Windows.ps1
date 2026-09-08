@@ -34,7 +34,7 @@ param(
     [string[]]$DriveLetter,
     [string]$RepairSource,
     [ValidateRange(1, 720)]
-    [int]$ServicingWaitMinutes = 120,
+    [int]$ServicingWaitMinutes = 720,
     [ValidateRange(1, 6)]
     [int]$MaxRepairRounds = 4,
     [ValidateRange(0, 1024)]
