@@ -23,6 +23,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 The script attempts elevation itself when launched without Administrator rights. It does not force or schedule a reboot, force-dismount a volume, kill servicing processes, or delete reboot markers. If Windows requires a reboot, the script returns `3010`; if any other unresolved state remains, it returns `1`.
 
+When a pending reboot marker is present, reboot Windows manually and run the script again; it intentionally stops before starting a competing servicing transaction. NTFS volumes with insufficient free space use an interactive `/f` fallback and dirty-bit verification instead of silently declaring an online `/scan` successful.
+
 Optional examples:
 
 ```powershell

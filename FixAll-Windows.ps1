@@ -228,6 +228,8 @@ function Read-AppendedNativeOutput {
         [Parameter(Mandatory = $true)][ref]$Position,
         [Parameter(Mandatory = $true)][string]$Label,
         [Parameter(Mandatory = $true)][string]$Level,
+        [double]$StartPercent = $script:LastPercent,
+        [double]$EndPercent = $StartPercent,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$Lines
     )
 
@@ -248,7 +250,15 @@ function Read-AppendedNativeOutput {
             $line = $reader.ReadLine()
             if ($null -ne $line) {
                 [void]$Lines.Add($line)
-                Write-RepairEvent -Percent $script:LastPercent -Message ('{0}: {1}' -f $Label, $line) -Level $Level
+                $linePercent = $StartPercent
+                $percentageMatch = [regex]::Match($line, '(?<![\d.])(?<value>\d{1,3}(?:\.\d+)?)%')
+                if ($percentageMatch.Success) {
+                    $nativePercent = [double]$percentageMatch.Groups['value'].Value
+                    if ($nativePercent -ge 0 -and $nativePercent -le 100) {
+                        $linePercent = $StartPercent + (($EndPercent - $StartPercent) * ($nativePercent / 100))
+                    }
+                }
+                Write-RepairEvent -Percent $linePercent -Message ('{0}: {1}' -f $Label, $line) -Level $Level
             }
         }
         $Position.Value = $stream.Position
@@ -312,8 +322,8 @@ function Invoke-NativeTracked {
             } -ArgumentList $FilePath, $argumentText, $stdoutPath, $stderrPath -ErrorAction Stop
 
             while ($true) {
-                Read-AppendedNativeOutput -Path $stdoutPath -Position ([ref]$stdoutPosition) -Label $Label -Level 'NATIVE' -Lines $lines
-                Read-AppendedNativeOutput -Path $stderrPath -Position ([ref]$stderrPosition) -Label $Label -Level 'WARN' -Lines $lines
+                Read-AppendedNativeOutput -Path $stdoutPath -Position ([ref]$stdoutPosition) -Label $Label -Level 'NATIVE' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
+                Read-AppendedNativeOutput -Path $stderrPath -Position ([ref]$stderrPosition) -Label $Label -Level 'WARN' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
 
                 $nativeJob = Get-Job -Id $nativeJob.Id -ErrorAction Stop
                 if ($nativeJob.State -notin @('NotStarted', 'Running')) {
@@ -331,8 +341,8 @@ function Invoke-NativeTracked {
             }
 
             Start-Sleep -Milliseconds 100
-            Read-AppendedNativeOutput -Path $stdoutPath -Position ([ref]$stdoutPosition) -Label $Label -Level 'NATIVE' -Lines $lines
-            Read-AppendedNativeOutput -Path $stderrPath -Position ([ref]$stderrPosition) -Label $Label -Level 'WARN' -Lines $lines
+            Read-AppendedNativeOutput -Path $stdoutPath -Position ([ref]$stdoutPosition) -Label $Label -Level 'NATIVE' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
+            Read-AppendedNativeOutput -Path $stderrPath -Position ([ref]$stderrPosition) -Label $Label -Level 'WARN' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
             if ($nativeJob.State -eq 'Completed') {
                 $received = @(Receive-Job -Job $nativeJob -ErrorAction Stop)
                 if ($received.Count -gt 0) {
@@ -390,7 +400,11 @@ function Invoke-DismPhase {
         Write-RepairEvent -Percent $StartPercent -Message ('Using explicit repair source: {0}' -f $RepairSource) -Level INFO
     }
     $result = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\Dism.exe') -Arguments $arguments -Label $Label -StartPercent $StartPercent -EndPercent $EndPercent
-    Add-RepairResult -Name $Label -Verdict $result.Verdict -ExitCode $result.ExitCode -Evidence $result.Evidence
+    $verdict = $result.Verdict
+    if ($verdict -eq 'FAIL' -and $Label -notmatch '(?i)final') {
+        $verdict = 'ATTENTION'
+    }
+    Add-RepairResult -Name $Label -Verdict $verdict -ExitCode $result.ExitCode -Evidence $result.Evidence
     return $result
 }
 
@@ -409,7 +423,10 @@ function Invoke-SfcPhase {
         $verdict = 'UNRESOLVED'
     }
     elseif ($Operation -eq '/scannow' -and $unresolvedText.Count -gt 0) {
-        $verdict = 'UNRESOLVED'
+        $verdict = 'ATTENTION'
+    }
+    elseif ($Operation -eq '/scannow' -and $result.ExitCode -ne 0) {
+        $verdict = 'ATTENTION'
     }
     $evidence = $result.Evidence
     if ($unresolvedText.Count -gt 0) {
@@ -430,9 +447,26 @@ function Invoke-VolumeCheck {
     $label = 'CHKDSK {0}' -f $drive
     $minimumBytes = [int64]$MinimumFreeSpaceGB * 1GB
     if ($Volume.FreeBytes -lt $minimumBytes) {
-        $evidence = 'Only {0} GB free; at least {1} GB is required for a safe online filesystem pass.' -f $Volume.FreeGB, $MinimumFreeSpaceGB
-        Write-RepairEvent -Percent $StartPercent -Message ('SKIP {0}: {1}' -f $label, $evidence) -Level ERROR
-        Add-RepairResult -Name $label -Verdict 'SKIPPED_LOW_SPACE' -ExitCode 11 -Evidence $evidence
+        $evidence = 'Only {0} GB free; online /scan may not create shadow-copy data. Falling back to interactive /f.' -f $Volume.FreeGB
+        Write-RepairEvent -Percent $StartPercent -Message ($label + ': ' + $evidence) -Level WARN
+        $fix = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') -Arguments @($drive, '/f') -Label ($label + ' low-space /f') -StartPercent $StartPercent -EndPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.78)) -Interactive
+        $repairNeedsReboot = ($fix.ExitCode -eq 3010) -or @($fix.Lines | Where-Object { $_ -match '(?i)schedule.*next restart|reboot|restart' }).Count -gt 0
+        if ($repairNeedsReboot) {
+            Add-RepairResult -Name $label -Verdict 'REBOOT_REQUIRED' -ExitCode 3010 -Evidence 'Low-space filesystem repair could not complete online and requires a reboot.'
+            return
+        }
+        if ($fix.ExitCode -notin @(0, 1)) {
+            Add-RepairResult -Name $label -Verdict 'FAIL' -ExitCode $fix.ExitCode -Evidence $fix.Evidence
+            return
+        }
+        $dirty = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\fsutil.exe') -Arguments @('dirty', 'query', $drive) -Label ($label + ' dirty-bit verification') -StartPercent ($StartPercent + (($EndPercent - $StartPercent) * 0.78)) -EndPercent $EndPercent
+        $cleanDirtyBit = ($dirty.ExitCode -eq 0) -and @($dirty.Lines | Where-Object { $_ -match '(?i)not dirty|is not dirty' }).Count -gt 0
+        if ($cleanDirtyBit) {
+            Add-RepairResult -Name $label -Verdict 'PASS' -ExitCode $fix.ExitCode -Evidence ('/f completed and the volume dirty bit is clear; online /scan was unavailable because free space was {0} GB.' -f $Volume.FreeGB)
+        }
+        else {
+            Add-RepairResult -Name $label -Verdict 'UNRESOLVED' -ExitCode $dirty.ExitCode -Evidence 'The low-space /f route completed without a clean dirty-bit verification.'
+        }
         return
     }
 
@@ -555,7 +589,7 @@ if ($SelfTest) {
     $script:CurrentStage = 'self-test'
     Write-RepairEvent -Percent 10 -Message 'Self-test mode: no repair commands will be launched.' -Level INFO
     $required = @('Dism.exe', 'sfc.exe', 'chkdsk.exe')
-    foreach ($name in $required) {
+    foreach ($name in ($required + 'fsutil.exe')) {
         if (Get-Command $name -ErrorAction SilentlyContinue) {
             Write-RepairEvent -Percent 20 -Message ('Found required tool: {0}' -f $name) -Level PASS
         }
@@ -573,7 +607,7 @@ if ($SelfTest) {
     catch {
         Add-RepairResult -Name 'Volume inventory' -Verdict 'FAIL' -ExitCode 1 -Evidence $_.Exception.Message
     }
-    $nativeSelfTest = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\cmd.exe') -Arguments @('/d', '/c', 'echo FixALL-native-selftest') -Label 'Native process capture self-test' -StartPercent 60 -EndPercent 80
+    $nativeSelfTest = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\cmd.exe') -Arguments @('/d', '/c', 'echo FixALL-native-selftest 50%') -Label 'Native process capture self-test' -StartPercent 60 -EndPercent 80
     if ($nativeSelfTest.ExitCode -eq 0 -and @($nativeSelfTest.Lines | Where-Object { $_ -match 'FixALL-native-selftest' }).Count -gt 0) {
         Add-RepairResult -Name 'Native process capture' -Verdict 'PASS' -Evidence 'Captured expected native stdout.'
     }
@@ -585,7 +619,7 @@ if ($SelfTest) {
 }
 
 $script:CurrentStage = 'preflight'
-foreach ($tool in @('Dism.exe', 'sfc.exe', 'chkdsk.exe')) {
+foreach ($tool in @('Dism.exe', 'sfc.exe', 'chkdsk.exe', 'fsutil.exe')) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         Add-RepairResult -Name ('Tool preflight ' + $tool) -Verdict 'BLOCKED' -ExitCode 9009 -Evidence 'Required Windows tool was not found.'
     }
