@@ -12,6 +12,8 @@
 
 The console shows native tool output and wrapper lines with wall-clock timestamps, elapsed milliseconds, stage percentages, exit codes, and a final unresolved-state summary. Each run writes a log under `RepairLogs`. A fresh servicing/pending-reboot guard runs before every repair-native phase; probe failures fail closed.
 
+Observability is evidence-based: native percentages are used only when the native tool actually prints them. During silent native work, the wrapper holds the phase percentage at its last measured value and emits elapsed time, native-process liveness, native-output line/character counts, last-output age, and a watchdog classification (`NATIVE_OUTPUT_RECENT`, `NO_NATIVE_OUTPUT_WATCH`, or `INTERACTIVE_CONSOLE`). While waiting for Windows servicing, each heartbeat records servicing-process responsiveness, an activity fingerprint, seconds without observed activity, and `SAFE_STALL_WATCH` when the transaction appears quiescent; the action remains wait-only and never kills servicing. A real repair run ends with an evidence-gated `READY_FOR_MANUAL_REBOOT`, `NOT_READY_REBOOT_REQUIRED`, or `NOT_READY_UNRESOLVED` classification. `-SelfTest` deliberately reports `NOT_ASSESSED_SELF_TEST` because tool discovery, volume inventory, and wrapper capture cannot prove that Windows itself is repaired.
+
 ## Run
 
 From an elevated Windows PowerShell 5.1 console:

@@ -54,6 +54,11 @@ $script:LogPath = $null
 $script:RunId = $null
 $script:LastPercent = 0.0
 $script:CurrentStage = 'startup'
+$script:LastNativeOutputAtUtc = $null
+$script:NativeOutputLinesSeen = 0
+$script:NativeOutputCharsSeen = 0
+$script:LastNativeReportedPercent = $null
+$script:NativeOutputMode = 'NOT_STARTED'
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -126,6 +131,81 @@ function Write-RepairEvent {
     }
     catch {
         # Progress rendering is best effort; the timestamped line is authoritative.
+    }
+}
+
+function Get-ServicingLivenessSummary {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Active)
+
+    $parts = @()
+    foreach ($item in $Active) {
+        try {
+            $process = Get-Process -Id $item.Id -ErrorAction Stop
+            $cpuSeconds = [math]::Round($process.TotalProcessorTime.TotalSeconds, 2)
+            $parts += ('{0}(PID {1};responding={2};cpu={3}s)' -f $process.ProcessName, $process.Id, $process.Responding, $cpuSeconds)
+        }
+        catch {
+            $parts += ('{0}(PID {1};liveness=UNKNOWN)' -f $item.ProcessName, $item.Id)
+        }
+    }
+
+    if ($parts.Count -eq 0) {
+        return 'none'
+    }
+    return ($parts -join ', ')
+}
+
+function Get-NativeProcessLiveness {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [int]$ProcessId = 0
+    )
+
+    if ($ProcessId -gt 0) {
+        try {
+            $process = Get-Process -Id $ProcessId -ErrorAction Stop
+            $cpuSeconds = [math]::Round($process.TotalProcessorTime.TotalSeconds, 2)
+            return ('{0}(PID {1};responding={2};cpu={3}s)' -f $process.ProcessName, $process.Id, $process.Responding, $cpuSeconds)
+        }
+        catch {
+            return ('PID {0}=NOT_FOUND' -f $ProcessId)
+        }
+    }
+
+    $name = [IO.Path]::GetFileNameWithoutExtension($FilePath)
+    return ('{0}=CHILD_PID_PENDING' -f $name)
+}
+
+function Get-NativeWatchdogSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][double]$PhaseStarted,
+        [int]$ProcessId = 0
+    )
+
+    $ageText = 'not-captured'
+    $watchdog = 'INTERACTIVE_CONSOLE'
+    if ($script:NativeOutputMode -ne 'INTERACTIVE_CONSOLE') {
+        if ($null -eq $script:LastNativeOutputAtUtc) {
+            $ageText = 'unknown'
+            $watchdog = 'NO_NATIVE_OUTPUT_YET'
+        }
+        else {
+            $ageSeconds = [math]::Max(0, [int](([DateTime]::UtcNow - $script:LastNativeOutputAtUtc).TotalSeconds))
+            $ageText = '{0}s' -f $ageSeconds
+            $watchdog = if ($ageSeconds -ge 60) { 'NO_NATIVE_OUTPUT_WATCH' } else { 'NATIVE_OUTPUT_RECENT' }
+        }
+    }
+
+    $reported = if ($null -eq $script:LastNativeReportedPercent) { 'unknown' } else { '{0:0.00}%' -f $script:LastNativeReportedPercent }
+    return [pscustomobject]@{
+        ElapsedSeconds = [int]($script:Clock.Elapsed.TotalSeconds - $PhaseStarted)
+        Process        = Get-NativeProcessLiveness -FilePath $FilePath -ProcessId $ProcessId
+        NativePercent  = $reported
+        LastOutputAge  = $ageText
+        Watchdog       = $watchdog
+        Lines          = $script:NativeOutputLinesSeen
+        Chars          = $script:NativeOutputCharsSeen
     }
 }
 
@@ -292,6 +372,8 @@ function Wait-ForServicingIdle {
     param([int]$MaximumMinutes)
 
     $started = $script:Clock.Elapsed.TotalSeconds
+    $lastFingerprint = $null
+    $lastActivityChange = $started
     while ($true) {
         $active = @(Get-ActiveServicingProcesses)
         if ($script:ProbeFailures.Count -gt 0) {
@@ -318,7 +400,22 @@ function Wait-ForServicingIdle {
         }
 
         $names = ($active | ForEach-Object { '{0} (PID {1})' -f $_.ProcessName, $_.Id }) -join ', '
-        Write-RepairEvent -Percent 4.5 -Message ('Waiting for servicing to settle; active: {0}' -f $names) -Level WARN
+        $fingerprint = Get-ServicingActivityFingerprint
+        $activityState = 'BASELINE'
+        if ($null -ne $lastFingerprint) {
+            if ($fingerprint -ne $lastFingerprint) {
+                $lastActivityChange = $script:Clock.Elapsed.TotalSeconds
+                $activityState = 'CHANGED'
+            }
+            else {
+                $activityState = 'UNCHANGED'
+            }
+        }
+        $lastFingerprint = $fingerprint
+        $unchangedSeconds = [int]($script:Clock.Elapsed.TotalSeconds - $lastActivityChange)
+        $watchdog = if ($unchangedSeconds -ge 60) { 'SAFE_STALL_WATCH' } else { 'SERVICING_ACTIVITY_MONITORED' }
+        $liveness = Get-ServicingLivenessSummary -Active $active
+        Write-RepairEvent -Percent 4.5 -Message ('SERVICING_HEARTBEAT; active={0}; liveness={1}; activity={2}; unchanged={3}s; watchdog={4}; action=WAIT_ONLY' -f $names, $liveness, $activityState, $unchangedSeconds, $watchdog) -Level WARN
         Start-Sleep -Seconds 5
     }
 }
@@ -460,11 +557,15 @@ function Read-AppendedNativeOutput {
                     $line = $line.Replace(([string][char]0xFEFF), [string]::Empty)
                 }
                 [void]$Lines.Add($line)
+                $script:LastNativeOutputAtUtc = [DateTime]::UtcNow
+                $script:NativeOutputLinesSeen++
+                $script:NativeOutputCharsSeen += [int64]$line.Length
                 $linePercent = $StartPercent
                 $percentageMatch = [regex]::Match($line, '(?<![\d.])(?<value>\d{1,3}(?:\.\d+)?)%')
                 if ($percentageMatch.Success) {
                     $nativePercent = [double]$percentageMatch.Groups['value'].Value
                     if ($nativePercent -ge 0 -and $nativePercent -le 100) {
+                        $script:LastNativeReportedPercent = $nativePercent
                         $linePercent = $StartPercent + (($EndPercent - $StartPercent) * ($nativePercent / 100))
                     }
                 }
@@ -520,17 +621,24 @@ function Invoke-NativeTracked {
     $lastHeartbeat = -1
     $exitCode = 9009
     $lines = New-Object System.Collections.ArrayList
+    $script:NativeOutputMode = if ($Interactive) { 'INTERACTIVE_CONSOLE' } else { 'CAPTURED_PIPE' }
+    $script:LastNativeOutputAtUtc = $null
+    $script:NativeOutputLinesSeen = 0
+    $script:NativeOutputCharsSeen = 0
+    $script:LastNativeReportedPercent = $null
+    $nativeProcessId = 0
+    $nativePidPath = $null
 
     try {
         if ($Interactive) {
             $process = Start-Process -FilePath $FilePath -ArgumentList $argumentText -PassThru -NoNewWindow -ErrorAction Stop
+            $nativeProcessId = [int]$process.Id
             while (-not $process.HasExited) {
                 $phaseSeconds = $script:Clock.Elapsed.TotalSeconds - $phaseStarted
                 if ([math]::Floor($phaseSeconds) -gt $lastHeartbeat) {
                     $lastHeartbeat = [math]::Floor($phaseSeconds)
-                    $fraction = [math]::Min(0.98, ($phaseSeconds / 3600))
-                    $percent = $StartPercent + (($EndPercent - $StartPercent) * $fraction)
-                    Write-RepairEvent -Percent $percent -Message ('RUNNING {0}; native console remains interactive; elapsed {1}s' -f $Label, [int]$phaseSeconds) -Level RUN
+                    $watch = Get-NativeWatchdogSnapshot -FilePath $FilePath -PhaseStarted $phaseStarted -ProcessId $nativeProcessId
+                    Write-RepairEvent -Percent $script:LastPercent -Message ('RUNNING {0}; elapsed={1}s; process={2}; nativeProgress={3}; lastNativeOutputAge={4}; watchdog={5}; outputLines={6}; outputChars={7}' -f $Label, $watch.ElapsedSeconds, $watch.Process, $watch.NativePercent, $watch.LastOutputAge, $watch.Watchdog, $watch.Lines, $watch.Chars) -Level RUN
                 }
                 Start-Sleep -Milliseconds 250
                 $process.Refresh()
@@ -548,17 +656,29 @@ function Invoke-NativeTracked {
             $token = [Guid]::NewGuid().ToString('N')
             $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) ('FixALL-{0}-{1}.stdout.log' -f $script:RunId, $token)
             $stderrPath = Join-Path ([IO.Path]::GetTempPath()) ('FixALL-{0}-{1}.stderr.log' -f $script:RunId, $token)
+            $nativePidPath = Join-Path ([IO.Path]::GetTempPath()) ('FixALL-{0}-{1}.pid' -f $script:RunId, $token)
             $stdoutPosition = [int64]0
             $stderrPosition = [int64]0
             $nativeJob = Start-Job -ScriptBlock {
-                param($childFilePath, $childArgumentText, $childStdoutPath, $childStderrPath)
-                $child = Start-Process -FilePath $childFilePath -ArgumentList $childArgumentText -RedirectStandardOutput $childStdoutPath -RedirectStandardError $childStderrPath -PassThru -NoNewWindow -Wait -ErrorAction Stop
+                param($childFilePath, $childArgumentText, $childStdoutPath, $childStderrPath, $childPidPath)
+                $child = Start-Process -FilePath $childFilePath -ArgumentList $childArgumentText -RedirectStandardOutput $childStdoutPath -RedirectStandardError $childStderrPath -PassThru -NoNewWindow -ErrorAction Stop
+                [IO.File]::WriteAllText($childPidPath, [string]$child.Id, [Text.Encoding]::ASCII)
+                $child.WaitForExit()
                 Write-Output ([int]$child.ExitCode)
-            } -ArgumentList $FilePath, $argumentText, $stdoutPath, $stderrPath -ErrorAction Stop
+            } -ArgumentList $FilePath, $argumentText, $stdoutPath, $stderrPath, $nativePidPath -ErrorAction Stop
 
             while ($true) {
                 Read-AppendedNativeOutput -Path $stdoutPath -Position ([ref]$stdoutPosition) -Label $Label -Level 'NATIVE' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
                 Read-AppendedNativeOutput -Path $stderrPath -Position ([ref]$stderrPosition) -Label $Label -Level 'WARN' -StartPercent $StartPercent -EndPercent $EndPercent -Lines $lines
+
+                if ($nativeProcessId -eq 0 -and (Test-Path -LiteralPath $nativePidPath)) {
+                    try {
+                        $nativeProcessId = [int](Get-Content -LiteralPath $nativePidPath -Raw -ErrorAction Stop).Trim()
+                    }
+                    catch {
+                        $nativeProcessId = 0
+                    }
+                }
 
                 $nativeJob = Get-Job -Id $nativeJob.Id -ErrorAction Stop
                 if ($nativeJob.State -notin @('NotStarted', 'Running')) {
@@ -568,9 +688,8 @@ function Invoke-NativeTracked {
                 $phaseSeconds = $script:Clock.Elapsed.TotalSeconds - $phaseStarted
                 if ([math]::Floor($phaseSeconds) -gt $lastHeartbeat) {
                     $lastHeartbeat = [math]::Floor($phaseSeconds)
-                    $fraction = [math]::Min(0.98, ($phaseSeconds / 3600))
-                    $percent = $StartPercent + (($EndPercent - $StartPercent) * $fraction)
-                    Write-RepairEvent -Percent $percent -Message ('RUNNING {0}; elapsed {1}s' -f $Label, [int]$phaseSeconds) -Level RUN
+                    $watch = Get-NativeWatchdogSnapshot -FilePath $FilePath -PhaseStarted $phaseStarted -ProcessId $nativeProcessId
+                    Write-RepairEvent -Percent $script:LastPercent -Message ('RUNNING {0}; elapsed={1}s; process={2}; nativeProgress={3}; lastNativeOutputAge={4}; watchdog={5}; outputLines={6}; outputChars={7}' -f $Label, $watch.ElapsedSeconds, $watch.Process, $watch.NativePercent, $watch.LastOutputAge, $watch.Watchdog, $watch.Lines, $watch.Chars) -Level RUN
                 }
                 Start-Sleep -Milliseconds 250
             }
@@ -593,7 +712,7 @@ function Invoke-NativeTracked {
                 $exitCode = 9009
             }
             Remove-Job -Job $nativeJob -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $stdoutPath, $stderrPath, $nativePidPath -Force -ErrorAction SilentlyContinue
         }
     }
     catch {
@@ -608,7 +727,9 @@ function Invoke-NativeTracked {
         $script:Unresolved += ('{0}: native process requested reboot (3010)' -f $Label)
     }
     $evidence = if ($lines.Count -gt 0) { ($lines | Select-Object -Last 3) -join ' | ' } else { 'No captured native text; see native system logs.' }
-    Write-RepairEvent -Percent $EndPercent -Message ('END {0}; exit={1}; verdict={2}' -f $Label, $exitCode, $verdict) -Level $(if ($verdict -eq 'PASS') { 'PASS' } elseif ($verdict -eq 'REBOOT_REQUIRED') { 'WARN' } else { 'ERROR' })
+    $finalOutputAge = if ($null -eq $script:LastNativeOutputAtUtc) { 'unknown' } else { '{0}s' -f [math]::Max(0, [int](([DateTime]::UtcNow - $script:LastNativeOutputAtUtc).TotalSeconds)) }
+    $finalNativePercent = if ($null -eq $script:LastNativeReportedPercent) { 'unknown' } else { '{0:0.00}%' -f $script:LastNativeReportedPercent }
+    Write-RepairEvent -Percent $EndPercent -Message ('END {0}; exit={1}; verdict={2}; nativeProgress={3}; lastNativeOutputAge={4}; outputLines={5}; outputChars={6}; watchdog=COMPLETE' -f $Label, $exitCode, $verdict, $finalNativePercent, $finalOutputAge, $script:NativeOutputLinesSeen, $script:NativeOutputCharsSeen) -Level $(if ($verdict -eq 'PASS') { 'PASS' } elseif ($verdict -eq 'REBOOT_REQUIRED') { 'WARN' } else { 'ERROR' })
 
     return [pscustomobject]@{
         Label     = $Label
@@ -831,12 +952,19 @@ function Invoke-VolumeCheck {
 }
 
 function Write-FinalSummary {
-    param([int]$ExitCode)
+    param(
+        [int]$ExitCode,
+        [switch]$SelfTestMode
+    )
 
     Write-Progress -Activity 'FixALL Windows repair' -Completed -Status 'Finished'
     Write-RepairEvent -Percent $(if ($ExitCode -eq 0) { 100 } else { $script:LastPercent }) -Message ('FINAL STATUS: {0}' -f $(if ($ExitCode -eq 0) { 'SUCCESS' } elseif ($ExitCode -eq 3010) { 'REBOOT_REQUIRED' } else { 'UNRESOLVED_FAILURE' })) -Level $(if ($ExitCode -eq 0) { 'PASS' } else { 'ERROR' })
+    $readiness = if ($SelfTestMode) { 'NOT_ASSESSED_SELF_TEST' } elseif ($ExitCode -eq 0) { 'READY_FOR_MANUAL_REBOOT' } elseif ($ExitCode -eq 3010) { 'NOT_READY_REBOOT_REQUIRED' } else { 'NOT_READY_UNRESOLVED' }
+    $readinessLevel = if ($SelfTestMode) { 'WARN' } elseif ($ExitCode -eq 0) { 'PASS' } else { 'ERROR' }
+    Write-RepairEvent -Percent $(if ($ExitCode -eq 0) { 100 } else { $script:LastPercent }) -Message ('REBOOT READINESS: {0}; evidence-gated classification only; no universal hardware or boot guarantee is claimed.' -f $readiness) -Level $readinessLevel
     Write-Host ''
     Write-Host '========== FixALL summary ==========' -ForegroundColor White
+    Write-Host ('Reboot readiness: {0}' -f $readiness) -ForegroundColor $(if ($SelfTestMode) { 'Yellow' } elseif ($ExitCode -eq 0) { 'Green' } else { 'Yellow' })
     foreach ($result in $script:Results) {
         Write-Host ('{0,-34} {1,-18} exit={2}' -f $result.Name, $result.Verdict, $result.ExitCode)
     }
@@ -895,6 +1023,7 @@ $script:LogPath = Join-Path $logRoot ('FixALL-{0}.log' -f $script:RunId)
 New-Item -ItemType File -Path $script:LogPath -Force | Out-Null
 
 Write-RepairEvent -Percent 0 -Message ('FixALL started; PowerShell {0}; PID {1}; run {2}' -f $PSVersionTable.PSVersion, $PID, $script:RunId) -Level INFO
+Write-RepairEvent -Percent 0 -Message 'Observability enabled: millisecond timestamps; phase progress; native output age; process liveness; servicing activity fingerprint; and explicit safe-stall/watchdog classification.' -Level INFO
 $osCaption = 'Windows'
 $osBuild = 'unknown'
 try {
@@ -932,14 +1061,14 @@ if ($SelfTest) {
     catch {
         Add-RepairResult -Name 'Volume inventory' -Verdict 'FAIL' -ExitCode 1 -Evidence $_.Exception.Message
     }
-    $nativeSelfTest = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\cmd.exe') -Arguments @('/d', '/c', 'echo FixALL-native-selftest 50%') -Label 'Native process capture self-test' -StartPercent 60 -EndPercent 80
+    $nativeSelfTest = Invoke-NativeTracked -FilePath (Join-Path $env:windir 'System32\cmd.exe') -Arguments @('/d', '/c', 'ping.exe 127.0.0.1 -n 4 >nul & echo FixALL-native-selftest 50%') -Label 'Native process capture self-test' -StartPercent 60 -EndPercent 80
     if ($nativeSelfTest.ExitCode -eq 0 -and @($nativeSelfTest.Lines | Where-Object { $_ -match 'FixALL-native-selftest' }).Count -gt 0) {
         Add-RepairResult -Name 'Native process capture' -Verdict 'PASS' -Evidence 'Captured expected native stdout.'
     }
     else {
         Add-RepairResult -Name 'Native process capture' -Verdict 'FAIL' -ExitCode $nativeSelfTest.ExitCode -Evidence 'Did not capture expected native stdout.'
     }
-    Write-FinalSummary -ExitCode $(if ($script:Unresolved.Count -eq 0) { 0 } else { 1 })
+    Write-FinalSummary -ExitCode $(if ($script:Unresolved.Count -eq 0) { 0 } else { 1 }) -SelfTestMode
     exit $(if ($script:Unresolved.Count -eq 0) { 0 } else { 1 })
 }
 
